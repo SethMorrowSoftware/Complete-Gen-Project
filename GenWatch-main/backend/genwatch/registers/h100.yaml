@@ -1,0 +1,276 @@
+# GenWatch — Generac H-100 register map
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The Generac H-100 controller exposes Modbus RTU on its RS-232 PC port
+# (factory default: slave 100, 9600 8N1, FC03 holding registers).
+#
+# The addresses below come from the jgyates/genmon project's
+# `generac_HPanel.py` — a field-tested open-source H-100 integration
+# that has been validated against real panels for years. They are the
+# de-facto community reference. Cross-checked against the Monico Inc.
+# "H100 Combined Data Map" published with their commercial gateway.
+#   https://github.com/jgyates/genmon/blob/master/genmonlib/generac_HPanel.py
+#   https://www.monicoinc.com/downloads/H100_Combined_Data_Map-WEB.xls
+#
+# An earlier version of this file shipped Generac *Evolution* (residential)
+# addresses by mistake — completely different address space. If your panel
+# is actually a G-Panel rather than H-100 the addresses shift by 6-0x20;
+# the genmon source documents both layouts.
+#
+# CONVENTIONS
+# -----------
+#   addr   : Modbus register address. Hex (0x...) preferred.
+#   fc     : Function code. 3=read holding, 4=read input, 6=write single,
+#            16=write multiple.
+#   type   : u16 | s16 | u32 | s32 | bitfld | enum
+#            (H-100 packs most 16-bit sensors into u32 slots — the
+#             meaningful value lives in the low word.)
+#   scale  : multiply raw integer by this to get engineering units.
+#   tier   : prime | base. Prime polls fast (state/alarm bits),
+#            base polls slow (telemetry).
+#
+# ALARM FILTERING (optional per-alarm knobs)
+# ------------------------------------------
+# Each entry in `alarm_bits` accepts two optional fields:
+#   - suppress_in_states: [list of engine_state names]
+#       The alarm is hidden from the UI / Slack / event log while the
+#       engine is in any of these states. Useful for H-100 firmware
+#       artifacts that fire in transitional states where the underlying
+#       signal isn't meaningful (e.g. phase-rotation alarms during
+#       cool-down). The alarm is still cleared correctly in the DB if
+#       its underlying bit goes low while suppressed.
+#   - min_poll_count: <int>
+#       Debounce — the bit must remain set for this many consecutive
+#       prime polls (1.5 s each by default) before the alarm is raised.
+#       Catches transient flickers like day-tank refill overshoot after
+#       an exercise. Default 1 = fire immediately.
+# Both default to no filtering when omitted.
+#
+# STATE AND ALARMS ARE BITFIELDS, NOT ENUMS
+# -----------------------------------------
+# The H-100 does *not* expose engine state as a single integer enum.
+# State is derived from bits across two registers:
+#   - output_status_1 (0x0082)   — "Generator Running", "Stopped", etc.
+#   - output_status_7 (0x0088)   — "Cranking", "In Cool Down", etc.
+# See `engine_state_bits` below for the priority-ordered decode rules.
+#
+# Alarms are similarly bit-flagged across output_status_2..8. Multiple
+# alarms can be active simultaneously. See `alarm_bits` below.
+#
+# CONTROL WRITES
+# --------------
+# Start/Stop/Transfer use FC16 (write multiple) at 0x019C, writing 3
+# registers at once with specific bit patterns. quiettest and ackalarm
+# are single-register FC16 writes. See `controls` below.
+
+site:
+  id: SITE-23
+  name: "Generac H-100"
+  rating_kw: 350
+  engine: "Cummins QSB7-G5"   # verify — QSB7 is unusual above ~300 kW; confirm engine name on the dataplate
+  tank_gal: 680
+  # Fuel type drives a few UI decisions:
+  #   - 'diesel'   hides the O₂ sensor card (diesels have no O₂ probe — the
+  #                  H-100 register reads 0 always on diesel installs)
+  #   - 'gaseous'  shows O₂ + AFR-related fields (NG/LP engines)
+  #   - 'unknown'  shows everything (legacy behaviour)
+  fuel_type: diesel
+  exercise:
+    enabled: true
+    day: sun        # mon|tue|wed|thu|fri|sat|sun
+    time: "03:00"   # 24h local
+    duration_min: 30
+    quiet: true
+
+modbus:
+  slave: 100        # 0x64 — H-100 factory default
+  read_fc: 3        # FC03 read holding (H-100 default)
+  prime_poll_ms: 1500
+  base_poll_ms: 15000
+  timeout_s: 1.5
+  retries: 2
+  backoff_s: [0.25, 0.5, 1.0]
+
+# ─── Engine state derivation ──────────────────────────────────────────────
+# Rules are evaluated in order; the first one whose `bits_set` are ALL
+# set in the named register wins. "alarm" rule should come first so a
+# faulted-while-running engine reports "alarm" not "running".
+engine_state_bits:
+  - { state: alarm,      register: output_status_1, mask: 0x8000 }   # Common Alarm
+  - { state: cranking,   register: output_status_7, mask: 0x1000 }   # Cranking
+  - { state: cooling,    register: output_status_7, mask: 0x2000 }   # In Cool Down
+  - { state: exercising, register: output_status_7, mask: 0x0020 }   # Internal Exercise Active
+  - { state: running,    register: output_status_1, mask: 0x2000 }   # Generator Running
+  - { state: stopped,    register: output_status_1, mask: 0x0100 }   # Stopped
+
+# ─── Panel key-switch decoding ────────────────────────────────────────────
+# H-100 front-panel key switch position. Remote control commands from this
+# UI only engage the controller when the panel is in AUTO. If MANUAL or
+# OFF, the operator at the unit has taken local control and remote writes
+# will be ignored (and audit-logged at the controller). Surfacing this in
+# the topbar prevents the "I clicked Start but nothing happened" mystery.
+#
+# First match wins. The AUTO bit (input_status_1 mask 0x8000 — "Switch In
+# Auto") is firmly known. MANUAL (0x4000) and OFF (0x2000) bit positions
+# are typical for H-100 / genmon-derived maps; verify on your unit with
+# `genwatch panel` while toggling the physical key switch, and adjust if
+# your firmware uses a different encoding.
+panel_mode_bits:
+  - { mode: "auto",    register: input_status_1, mask: 0x8000 }
+  - { mode: "manual",  register: input_status_1, mask: 0x4000 }   # verify on your H-100
+  - { mode: "off",     register: input_status_1, mask: 0x2000 }   # verify on your H-100
+
+# ─── Alarm decoding ───────────────────────────────────────────────────────
+# Each entry is one bit in one of the output_status_N bitfield registers.
+# When the bit is set, the alarm is active. Multiple can be active at
+# once; the state machine tracks them as a set.
+alarm_bits:
+  # output_status_1 (0x0082) — top-level
+  - { register: output_status_1, mask: 0x8000, code: "COMMON_ALARM",        desc: "Common Alarm",                  severity: alarm }
+  - { register: output_status_1, mask: 0x4000, code: "COMMON_WARNING",      desc: "Common Warning",                severity: warn  }
+  - { register: output_status_1, mask: 0x0200, code: "STOPPED_IN_ALARM",    desc: "Stopped in Alarm",              severity: alarm }
+  - { register: output_status_1, mask: 0x0010, code: "OVERCRANK",           desc: "Overcrank",                     severity: alarm }
+  - { register: output_status_1, mask: 0x0008, code: "OIL_INHIBIT",         desc: "Oil Inhibit Alarm",             severity: alarm }
+  - { register: output_status_1, mask: 0x0002, code: "OIL_TEMP_HIGH_ALARM", desc: "Oil Temp High Alarm",           severity: alarm }
+  - { register: output_status_1, mask: 0x0001, code: "OIL_TEMP_LOW_ALARM",  desc: "Oil Temp Low Alarm",            severity: alarm }
+  # output_status_2 (0x0083) — oil/coolant
+  - { register: output_status_2, mask: 0x8000, code: "OIL_TEMP_HIGH_WARN",  desc: "Oil Temp High Warning",         severity: warn  }
+  - { register: output_status_2, mask: 0x4000, code: "OIL_TEMP_LOW_WARN",   desc: "Oil Temp Low Warning",          severity: warn  }
+  - { register: output_status_2, mask: 0x2000, code: "OIL_TEMP_FAULT",      desc: "Oil Temp Sensor Fault",         severity: warn  }
+  - { register: output_status_2, mask: 0x1000, code: "COOLANT_TEMP_HIGH_ALARM", desc: "Coolant Temp High Alarm",   severity: alarm }
+  - { register: output_status_2, mask: 0x0800, code: "COOLANT_TEMP_LOW_ALARM",  desc: "Coolant Temp Low Alarm",    severity: alarm }
+  - { register: output_status_2, mask: 0x0400, code: "COOLANT_TEMP_HIGH_WARN",  desc: "Coolant Temp High Warning", severity: warn  }
+  - { register: output_status_2, mask: 0x0200, code: "COOLANT_TEMP_LOW_WARN",   desc: "Coolant Temp Low Warning",  severity: warn  }
+  - { register: output_status_2, mask: 0x0100, code: "COOLANT_TEMP_FAULT",  desc: "Coolant Temp Sensor Fault",     severity: warn  }
+  - { register: output_status_2, mask: 0x0080, code: "OIL_PRESSURE_HIGH_ALARM", desc: "Oil Pressure High Alarm",   severity: alarm }
+  - { register: output_status_2, mask: 0x0040, code: "OIL_PRESSURE_LOW_ALARM",  desc: "Oil Pressure Low Alarm",    severity: alarm }
+  - { register: output_status_2, mask: 0x0020, code: "OIL_PRESSURE_HIGH_WARN",  desc: "Oil Pressure High Warning", severity: warn  }
+  - { register: output_status_2, mask: 0x0010, code: "OIL_PRESSURE_LOW_WARN",   desc: "Oil Pressure Low Warning",  severity: warn  }
+  - { register: output_status_2, mask: 0x0008, code: "OIL_PRESSURE_FAULT", desc: "Oil Pressure Sensor Fault",      severity: warn  }
+  - { register: output_status_2, mask: 0x0004, code: "COOLANT_LEVEL_HIGH_ALARM", desc: "Coolant Level High Alarm", severity: alarm }
+  - { register: output_status_2, mask: 0x0002, code: "COOLANT_LEVEL_LOW_ALARM",  desc: "Coolant Level Low Alarm",  severity: alarm }
+  - { register: output_status_2, mask: 0x0001, code: "COOLANT_LEVEL_HIGH_WARN",  desc: "Coolant Level High Warning", severity: warn }
+  # output_status_3 (0x0084) — coolant level / fuel / throttle
+  - { register: output_status_3, mask: 0x8000, code: "COOLANT_LEVEL_LOW_WARN",   desc: "Coolant Level Low Warning", severity: warn }
+  - { register: output_status_3, mask: 0x4000, code: "COOLANT_LEVEL_FAULT",  desc: "Coolant Level Sensor Fault",    severity: warn  }
+  # Fuel-high alarms are debounced to ~30 s of sustained signal because
+  # day-tank refill transients and thermal expansion after an exercise
+  # can briefly push the level past the H-100's high threshold without
+  # representing a real overfill condition. A genuine overfill stays
+  # asserted well past 20 polls (~30 s at 1.5 s prime cadence).
+  - { register: output_status_3, mask: 0x2000, code: "FUEL_LEVEL_HIGH_ALARM", desc: "Fuel Level High Alarm",        severity: alarm, min_poll_count: 20 }
+  - { register: output_status_3, mask: 0x1000, code: "FUEL_LEVEL_LOW_ALARM",  desc: "Fuel Level Low Alarm",         severity: alarm }
+  - { register: output_status_3, mask: 0x0800, code: "FUEL_LEVEL_HIGH_WARN",  desc: "Fuel Level High Warning",      severity: warn,  min_poll_count: 20 }
+  - { register: output_status_3, mask: 0x0400, code: "FUEL_LEVEL_LOW_WARN",   desc: "Fuel Level Low Warning",       severity: warn  }
+  - { register: output_status_3, mask: 0x0200, code: "FUEL_LEVEL_FAULT",      desc: "Fuel Level Sensor Fault",      severity: warn  }
+  - { register: output_status_3, mask: 0x0008, code: "THROTTLE_HIGH_ALARM",   desc: "Throttle Position High Alarm", severity: alarm }
+  - { register: output_status_3, mask: 0x0004, code: "THROTTLE_LOW_ALARM",    desc: "Throttle Position Low Alarm",  severity: alarm }
+  # output_status_4 (0x0085) — battery
+  - { register: output_status_4, mask: 0x8000, code: "THROTTLE_FAULT",        desc: "Throttle Position Fault",      severity: warn  }
+  - { register: output_status_4, mask: 0x0010, code: "BATT_VOLT_HIGH_ALARM",  desc: "Battery Voltage High Alarm",   severity: alarm }
+  - { register: output_status_4, mask: 0x0008, code: "BATT_VOLT_LOW_ALARM",   desc: "Battery Voltage Low Alarm",    severity: alarm }
+  - { register: output_status_4, mask: 0x0004, code: "BATT_VOLT_HIGH_WARN",   desc: "Battery Voltage High Warning", severity: warn  }
+  - { register: output_status_4, mask: 0x0002, code: "BATT_VOLT_LOW_WARN",    desc: "Battery Voltage Low Warning",  severity: warn  }
+  - { register: output_status_4, mask: 0x0001, code: "BATT_VOLT_FAULT",       desc: "Battery Voltage Sensor Fault", severity: warn  }
+  # output_status_5 (0x0086) — AC output
+  - { register: output_status_5, mask: 0x1000, code: "AVG_VOLT_HIGH_ALARM",   desc: "Average Voltage High Alarm",   severity: alarm }
+  - { register: output_status_5, mask: 0x0800, code: "AVG_VOLT_LOW_ALARM",    desc: "Average Voltage Low Alarm",    severity: alarm }
+  - { register: output_status_5, mask: 0x0010, code: "FREQ_HIGH_ALARM",       desc: "Generator Frequency High Alarm", severity: alarm }
+  - { register: output_status_5, mask: 0x0008, code: "FREQ_LOW_ALARM",        desc: "Generator Frequency Low Alarm",  severity: alarm }
+  # output_status_6 (0x0087) — RPM and DI
+  - { register: output_status_6, mask: 0x8000, code: "RPM_HIGH_ALARM",        desc: "Engine RPM High Alarm",        severity: alarm }
+  - { register: output_status_6, mask: 0x4000, code: "RPM_LOW_ALARM",         desc: "Engine RPM Low Alarm",         severity: alarm }
+  - { register: output_status_6, mask: 0x0800, code: "RPM_FAULT",             desc: "Engine RPM Sensor Fault",      severity: warn  }
+  - { register: output_status_6, mask: 0x0040, code: "BATT_CHARGER_FAIL",     desc: "Battery Charger Fail (DI-1)",  severity: warn  }
+  # output_status_7 (0x0088) — operational
+  - { register: output_status_7, mask: 0x0800, code: "NEEDS_SERVICE",         desc: "Needs Service",                severity: warn  }
+  - { register: output_status_7, mask: 0x0400, code: "SHUTDOWN",              desc: "Shutdown",                     severity: alarm }
+  # Phase-rotation "alarms" are informational notices (note the
+  # description begins with "Check..."). The H-100's phase detector
+  # needs stable AC to evaluate rotation, which it does not have
+  # during cranking (no output yet), cool-down (AVR spinning down),
+  # or stopped (no signal). Bits frequently latch falsely in those
+  # states. Suppress them there, and debounce 3 polls (~4.5 s) so a
+  # brief transient inside `running` doesn't fire either.
+  - { register: output_status_7, mask: 0x0200, code: "VOLT_PHASE_ROTATION",   desc: "Check Voltage Phase Rotation", severity: warn, suppress_in_states: [cooling, cranking, stopped], min_poll_count: 3 }
+  - { register: output_status_7, mask: 0x0100, code: "CURR_PHASE_ROTATION",   desc: "Check Current Phase Rotation", severity: warn, suppress_in_states: [cooling, cranking, stopped], min_poll_count: 3 }
+  # output_status_8 (0x0089)
+  - { register: output_status_8, mask: 0x0200, code: "RPM_MISSING",           desc: "RPM Signal Missing",           severity: alarm }
+
+# ─── Read registers ───────────────────────────────────────────────────────
+registers:
+  # Prime · 1.5 s — bitfields used for state + alarm derivation
+  - { name: input_status_1,    addr: 0x0080, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_1,   addr: 0x0082, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_2,   addr: 0x0083, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_3,   addr: 0x0084, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_4,   addr: 0x0085, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_5,   addr: 0x0086, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_6,   addr: 0x0087, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_7,   addr: 0x0088, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_8,   addr: 0x0089, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+
+  # Base · 15 s — engine telemetry
+  # The H-100 returns these as 2-register (u32) slots, but the meaningful
+  # value sits in the LOW word — the high word is reserved/zero. We decode
+  # them as `u32_lo`, which reads only the low word, so a framing slip on
+  # the RTU-over-TCP bridge that leaves garbage in the high word can't
+  # blow a reading up by ~65536× (a 188 °F coolant temp masquerading as
+  # millions). When the high word is zero — the documented normal case —
+  # u32_lo is identical to the old u32 decode. Genuine 32-bit counters
+  # that legitimately use both words (run_hours, below) stay `u32`.
+  - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F }
+  - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
+  - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct, scale: 0.1 }
+  - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: throttle_position, addr: 0x0096, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: batt_charge_current, addr: 0x009A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: A }
+  - { name: battery_volts,     addr: 0x009C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: V,    scale: 0.01, warn_range: [12.6, 14.6] }
+
+  # Base · 15 s — AC output (all 16-bit-in-u32 → u32_lo, see note above)
+  - { name: gen_current_a,     addr: 0x009E, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_b,     addr: 0x00A0, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_c,     addr: 0x00A2, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: avg_current,       addr: 0x00A4, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_voltage_ab,    addr: 0x00A6, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_bc,    addr: 0x00A8, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_ca,    addr: 0x00AA, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: avg_voltage,       addr: 0x00AC, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: total_kw,          addr: 0x00AE, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: kW }
+  - { name: power_factor,      addr: 0x00B0, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: pf, scale: 0.01 }
+  - { name: frequency,         addr: 0x00B2, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
+  - { name: rpm,               addr: 0x00B4, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
+
+  # Base · 15 s — counters / status
+  - { name: active_alarm_count, addr: 0x012F, fc: 3, type: u16, tier: prime, group: "State", unit: count }
+  - { name: run_hours,         addr: 0x0130, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h }
+  - { name: engine_status_code, addr: 0x0132, fc: 3, type: u16, tier: prime, group: "State", unit: enum }
+  - { name: key_switch_state,  addr: 0x01A0, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: quiettest_status,  addr: 0x022B, fc: 3, type: u16, tier: prime, group: "State", unit: enum }
+
+  # NOTE: start_count is not exposed in the H-100 Modbus map. The UI
+  # field will read as null until/unless we surface it from the event
+  # log. Leaving the name out of the YAML so we don't poll a dead addr.
+
+# ─── Control writes ───────────────────────────────────────────────────────
+# start / stop / starttransfer use FC16 to write THREE consecutive
+# registers at 0x019C (START_BITS, START_BITS_2, START_BITS_3). Each
+# command has a specific bit pattern. quiettest and ackalarm are
+# single-register FC16 writes to their own registers.
+#
+# Bit patterns from genmon's `SetGeneratorRemoteCommand`:
+#   start          → [0x0080, 0x0000, 0x0000] at 0x019C
+#   stop           → [0x0000, 0x0000, 0x0000] at 0x019C
+#   starttransfer  → [0x0080, 0x0000, 0x0080] at 0x019C
+#   quiettest      → [0x0001]                  at 0x022B
+#   quietteststop  → [0x0000]                  at 0x022B
+#   ackalarm       → [0x0001]                  at 0x012E
+controls:
+  - { name: remote_start, addr: 0x019C, fc: 16, values: [0x0080, 0x0000, 0x0000], desc: "Remote start (no transfer)" }
+  - { name: remote_stop,  addr: 0x019C, fc: 16, values: [0x0000, 0x0000, 0x0000], desc: "Remote stop / cool-down" }
+  - { name: transfer,     addr: 0x019C, fc: 16, values: [0x0080, 0x0000, 0x0080], desc: "Remote start + transfer to generator" }
+  - { name: exercise,     addr: 0x022B, fc: 16, values: [0x0001], desc: "Begin quiet test (unloaded exercise)" }
+  - { name: ack_alarm,    addr: 0x012E, fc: 16, values: [0x0001], desc: "Acknowledge/clear alarm" }
