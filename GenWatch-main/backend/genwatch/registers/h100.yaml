@@ -121,6 +121,19 @@ panel_mode_bits:
   - { mode: "manual",  register: input_status_1, mask: 0x4000 }   # verify on your H-100
   - { mode: "off",     register: input_status_1, mask: 0x2000 }   # verify on your H-100
 
+# ─── Numeric range alarms (optional software backstop) ────────────────────
+# When true, GenWatch raises warn/alarm events when a register's decoded value
+# leaves its warn_range / alarm_range band (below), as a software backstop on
+# top of the H-100's own status bits. Evaluated ONLY while the engine is
+# running/exercising, only on fresh values, and debounced.
+#
+# DEFAULT FALSE on purpose: the bands below ship UNVERIFIED for any specific
+# unit (e.g. battery_volts is a 12 V band; a 24 V start bank floats ~26 V and
+# would false-alarm). Enable this per-site ONLY after you have confirmed every
+# warn_range/alarm_range against the actual panel — otherwise you get alarm
+# fatigue on a live generator.
+numeric_alarms_enabled: false
+
 # ─── Alarm decoding ───────────────────────────────────────────────────────
 # Each entry is one bit in one of the output_status_N bitfield registers.
 # When the bit is set, the alarm is active. Multiple can be active at
