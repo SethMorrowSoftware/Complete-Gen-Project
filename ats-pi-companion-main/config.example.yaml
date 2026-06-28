@@ -145,8 +145,10 @@ io:
   asco_serial:
     # Serial link. 8N1 is fixed by ASCO doc 381339-221 (RTU mode only). Set the
     # controller's RS485 address + baud on its front panel (General →
-    # Communication) and match them here. 'port' is the USB-RS485 adapter.
-    port: /dev/ttyUSB0
+    # Communication) and match them here. 'port' is the USB-RS485 adapter —
+    # use the STABLE /dev/atspi-asco symlink (udev/99-atspi-serial.rules, which
+    # install.sh deploys), NOT a raw /dev/ttyUSB0 that moves across reboots.
+    port: /dev/atspi-asco
     baudrate: 19200
     bytesize: 8
     parity: "N"

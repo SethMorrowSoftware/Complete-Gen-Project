@@ -41,6 +41,18 @@ package version — see `atspi.ICD_VERSION` for the wire-protocol version.
   verifies it) so a kernel/USB hang hard-resets the Pi — the software watchdog
   can't restart pid 1. The companion is the device that physically commands the
   switch and previously had no Pi-level watchdog (GenWatch did).
+- **Stable serial device path (H-6).** Added `udev/99-atspi-serial.rules`
+  (deployed + reloaded by `install.sh`) creating a stable `/dev/atspi-asco`
+  symlink for the Waveshare USB-RS485 adapter; the config default is now that
+  symlink, not a raw `/dev/ttyUSB0` that moves across reboot/re-plug and
+  silently broke ASCO sensing.
+- **Hash-pinned dependencies (H-7).** Added `requirements.lock` (pip-compile
+  `--generate-hashes`); `install.sh` installs deps with `--require-hashes` and
+  the package `--no-deps`, and refuses to install without the lock (override
+  with `ATSPI_ALLOW_UNPINNED=1`). The two Pis and every re-image now get
+  byte-identical, tamper-evident wheels.
+- **NTP enforced at install (M-3).** `install.sh` enables time sync and reports
+  sync status — the ICD <5 s skew is a hard contract and the Pi has no RTC.
 - **systemd unit hardened (M-1, M-2).** `Restart=always` +
   `StartLimitIntervalSec=0` (an unattended safety device must never latch in
   `failed` requiring on-site `reset-failed`); `OOMScoreAdjust=-200` and memory/

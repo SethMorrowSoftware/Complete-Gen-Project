@@ -97,7 +97,10 @@ class AscoSerialCfg:
     they are supplied (io_asco_serial.AscoSerialConfig.validate). See
     HARDWARE.md §3.1.
     """
-    port: str = "/dev/ttyUSB0"
+    # Stable udev symlink created by udev/99-atspi-serial.rules (install.sh
+    # deploys it). Do NOT default to a raw /dev/ttyUSB0 — that index is not
+    # stable across reboot/re-plug and silently breaks ASCO sensing.
+    port: str = "/dev/atspi-asco"
     baudrate: int = 19200
     bytesize: int = 8
     parity: str = "N"
