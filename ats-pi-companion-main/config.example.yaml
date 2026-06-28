@@ -1,0 +1,191 @@
+# ATS-Pi companion service configuration
+#
+# Install:
+#   sudo mkdir -p /etc/atspi
+#   sudo cp config.example.yaml /etc/atspi/config.yaml
+#   sudo nano /etc/atspi/config.yaml
+#
+# See README.md for setup and docs/SPEC.md for behaviour.
+
+# ─── Modbus TCP server (the interface GenWatch reads) ─────────────────────
+# Bind address and port for the inbound Modbus TCP server. The default is the
+# high port 5020, NOT the privileged Modbus port 502: the service runs as the
+# non-root `atspi` user (no CAP_NET_BIND_SERVICE) and cannot bind 502. GenWatch's
+# `ats.port` must match this value (its default is 5020 too).
+#
+# SECURITY / F3: Modbus/TCP has NO authentication. Anything that can route to
+# this port can drive Test / Inhibit / Force-Transfer / Bypass within the
+# assumed_mode policy. For a CONTROL deployment the network boundary is a
+# SAFETY control, not just tidiness — make it a deliberate, documented choice:
+#   1. Bind `host` to the specific OT-VLAN interface IP (e.g. 192.168.1.250),
+#      NOT 0.0.0.0, so the server isn't reachable from other interfaces.
+#   2. Firewall-allowlist so ONLY the GenWatch Pi can reach <pi>:5020.
+# See HARDWARE.md §4.1. (0.0.0.0 is the dev default; change it for the plant.)
+modbus_server:
+  host: 0.0.0.0
+  port: 5020
+  unit_id: 1
+
+# ─── I/O driver (the physical interface to the ASCO) ──────────────────────
+# driver: 'mock'   — no hardware; for dev/CI and integration testing
+#         'adam'   — Advantech ADAM-6060 on Modbus TCP (production); reads all
+#                    6 sense inputs as dry contacts (needs 18RX + 14AA/14BA
+#                    accessories for position/source-availability) and drives
+#                    the 4 command relays
+#         'hybrid' — monitor over serial, control over the ADAM. Reads position
+#                    + source availability straight from the ASCO Group 5
+#                    controller over RS-485 Modbus RTU (a USB-RS485 adapter on
+#                    the Pi), so NO 18RX / aux-contact accessories are needed;
+#                    the ADAM still drives the 4 command relays (terminals
+#                    6-13) and keeps the F1 hardware fail-safe. See
+#                    HARDWARE.md §3.1. Configure BOTH io.adam (outputs) and
+#                    io.asco_serial (inputs) below.
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ PRODUCTION DEPLOY: change `driver: mock` to `driver: adam`. With    │
+# │ mock the service reads from RAM, not hardware — Modbus clients see  │
+# │ a healthy utility/both-available snapshot forever and the ATS       │
+# │ could be in any state. Always run `atspi-bench --host <adam-ip>`    │
+# │ before flipping — it catches wiring/mapping issues at the bench,    │
+# │ not at the site.                                                    │
+# └─────────────────────────────────────────────────────────────────────┘
+io:
+  driver: mock
+
+  # Used when driver: adam
+  adam:
+    host: 192.168.1.251
+    port: 502
+    unit_id: 1
+
+    # How the ADAM exposes its 6 digital inputs over Modbus:
+    #   coils           — FC01 read_coils  (current default)
+    #   discrete_inputs — FC02 read_discrete_inputs
+    # On the ADAM-6000 series the documented mapping for DIs is FC02; some
+    # firmware also mirrors them into the coil space (FC01). CONFIRM ON THE
+    # BENCH: if the live DI snapshot reads all-0 / position stays 'unknown'
+    # with the default, switch to discrete_inputs. atspi-bench --di-read and
+    # testadam.sh --di-read let you try both without editing config. The relay
+    # outputs are always coils (FC01 read-back / FC05 write).
+    di_read: coils
+
+    # Input debounce: a level contact (on-normal, on-emergency, source-
+    # available, engine-start) must read the same value on this many
+    # consecutive 10 Hz samples before the change is published. 3 ≈ 300 ms —
+    # invisible against ATS moves (seconds) but rejects contact bounce / EMI
+    # on long control-wire runs. Raise it for a noisy site; set 1 to disable.
+    # The momentary Load Disconnect contact (DI 0) is never debounced.
+    debounce_samples: 3
+
+    # The ADAM-6060 has no spare DI for an Auto/Manual sense contact (all six
+    # are used), so the ATS mode is operator-asserted here rather than read
+    # from hardware. This is also a command gate (ICD §6 mode policy):
+    #   auto    — all commands allowed (default)
+    #   manual  — only cmd_inhibit allowed; test/force-transfer/bypass rejected
+    #   test    — all commands rejected
+    #   unknown — all commands rejected
+    # Set 'manual' to make the Pi observe-and-inhibit-only — GenWatch can never
+    # force a transfer or start a test through it.
+    assumed_mode: auto
+
+    # ── ADAM hardware fail-safe self-check (F1, safety-critical) ──────────────
+    # The ADAM's own host-idle watchdog + per-DO safety values are the ONLY
+    # thing that releases a latched Force-Transfer / Inhibit relay if the Pi
+    # itself dies (the software watchdog in safety.py dies with the process).
+    # It is configured by hand at commissioning (HARDWARE.md §5.1). With
+    # require_hw_watchdog: true (default) the driver reads that config back on
+    # connect and REFUSES to assert any output (and publishes a persistent
+    # OUTPUT_FAULT, surfaced as a fault alarm in GenWatch) unless it confirms:
+    # watchdog enabled, timeout in the 5–10 s band, every DO safety value OFF.
+    #
+    # Set require_hw_watchdog: false ONLY as an explicit, auditable waiver for
+    # bench work (atspi-bench already waives it internally).
+    #
+    # ADAM-6060 NOTE: bench validation found the 6060 does NOT expose its
+    # FSV/watchdog config over Modbus (BENCH.md §10 finding 4), so this
+    # readback can never pass on that model. For the 6060, set
+    # require_hw_watchdog: false and treat the §5.1 cable-pull test as the F1
+    # gate (NEXTSTEPS.md Stage 2) — and re-run that test after any ADAM swap
+    # or factory reset, because nothing in software will warn you.
+    require_hw_watchdog: true
+
+    # Register addresses for that readback. These are BENCH-VERIFY and left
+    # UNSET below: pull them from the ADAM-6000 Series User Manual (Appendix B,
+    # "Modbus/TCP addresses of ADAM-6000 modules") and CONFIRM ON THE UNIT —
+    # they vary by model/firmware, exactly like di_read above. While unset (and
+    # require_hw_watchdog: true) the check fails CLOSED, so commissioning can't
+    # proceed until they're filled in and the §5.1 cable-pull test passes.
+    # Addresses are PDU offsets (0-based), as used by read_holding_registers.
+    # hw_watchdog:
+    #   enable_register: 0x0000           # host-idle watchdog enable register
+    #   enable_expected: 1                # value that means "enabled"
+    #   timeout_register: 0x0000          # watchdog timeout register
+    #   timeout_scale_s: 0.1              # seconds per raw count (many fw: 0.1 s)
+    #   timeout_min_s: 5                  # armed band, matching HARDWARE.md §5.1
+    #   timeout_max_s: 10
+    #   safety_value_register_base: 0x0000  # first per-DO safety-value register
+    #   safety_value_count: 6             # DO 0..5 (all must read 0/OFF)
+
+  # Used when driver: hybrid — the ASCO Group 5 controller read over RS-485
+  # Modbus RTU (USB-RS485 adapter → the controller's serial/DB9 port). This
+  # replaces the 18RX + 14AA/14BA accessories: position and source availability
+  # come straight from the controller. (Control still goes through io.adam
+  # above — the ADAM relays on terminals 6-13.) See HARDWARE.md §3.1.
+  asco_serial:
+    # Serial link. 8N1 is fixed by ASCO doc 381339-221 (RTU mode only). Set the
+    # controller's RS485 address + baud on its front panel (General →
+    # Communication) and match them here. 'port' is the USB-RS485 adapter.
+    port: /dev/ttyUSB0
+    baudrate: 19200
+    bytesize: 8
+    parity: "N"
+    stopbits: 1
+    unit_id: 1            # controller RS485 address (1-247)
+    timeout_s: 1.0
+
+    # ATS mode reported to GenWatch and used as the command gate (ICD §6), same
+    # semantics as io.adam.assumed_mode: auto|manual|test|unknown. (Mapping the
+    # controller's *real* mode register is a future bench-verify item.)
+    assumed_mode: auto
+
+    # ── Group 5 status map (holding registers, FC03) — ALL BENCH-VERIFY ──
+    # Pull these from ASCO doc 381339-221 ("Connectivity to the Power Manager Xp
+    # & 7000 Series Group 5 Controller via Modbus") and CONFIRM ON THE UNIT;
+    # they can shift by firmware, exactly like the io.adam addresses above.
+    # Bit indices are FLAT across the read block: bit b lives in register
+    # (status_register + b//16), bit (b%16). status_register + the four required
+    # bits MUST be set or the hybrid driver refuses to start (it will not
+    # publish a guessed switch position for a live switch).
+    #   status_register: 0x0000          # first status holding register (PDU offset)
+    #   status_register_count: 1         # consecutive words read as one bit array
+    #   on_normal_bit: 0                 # load is on the Normal (utility) source
+    #   on_emergency_bit: 1              # load is on the Emergency (generator) source
+    #   normal_available_bit: 2          # Normal source available
+    #   emergency_available_bit: 3       # Emergency source available
+    #   transferring_bit: 4              # optional: transfer in progress. If unset,
+    #                                    #   position reads 'unknown' for the whole
+    #                                    #   transfer stroke (never 'transferring').
+    #   engine_start_bit: 5              # optional: engine-start asserted. If unset,
+    #                                    #   engine_start_calling is always 0 — GenWatch
+    #                                    #   never sees engine-start over the serial path.
+
+# ─── Site identification ──────────────────────────────────────────────────
+# Reported via the ats_pi_unit_id register (ICD §5.4). GenWatch's
+# expected_unit_id sanity check compares against this value.
+site:
+  unit_id: 23
+
+# ─── Persistence ──────────────────────────────────────────────────────────
+# The transfer_count_lifetime counter MUST survive reboots per ICD §9.3.
+persistence:
+  state_file: /var/lib/atspi/state.json
+
+# ─── Health endpoint (optional) ───────────────────────────────────────────
+# Localhost-bound JSON status endpoint at GET /health. Off by default;
+# opt-in for sites that want external monitoring (Prometheus scraper,
+# cron health-check, dashboard) without speaking Modbus.
+#
+# health:
+#   enabled: true
+#   host: 127.0.0.1
+#   port: 8001
