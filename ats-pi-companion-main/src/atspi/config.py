@@ -73,6 +73,14 @@ class AdamCfg:
     # false ONLY as an explicit, auditable waiver for bench work. When true, the
     # hw_watchdog register addresses below must be configured and bench-verified.
     require_hw_watchdog: bool = True
+    # Second, explicit acknowledgement required to run with the F1 fail-safe
+    # waived (require_hw_watchdog: false). Without the ADAM readback gate AND
+    # without a Pi-level hardware watchdog there is NO automatic release if the
+    # Pi process dies with a relay latched — only the procedural cable-pull
+    # test. Refusing to start unless the operator explicitly sets this keeps the
+    # one-line `require_hw_watchdog: false` from silently removing the last
+    # crash-time backstop. See __main__._enforce_hw_watchdog_waiver / HARDWARE §5.
+    i_understand_no_crash_backstop: bool = False
     hw_watchdog: HwWatchdogCfg = field(default_factory=HwWatchdogCfg)
 
 

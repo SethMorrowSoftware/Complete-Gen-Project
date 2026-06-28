@@ -236,11 +236,21 @@ class RegisterStore:
                 and inputs.position == "utility"
             )
 
+            # A lifetime-count increment is durability-critical: GenWatch
+            # treats transfer_count_lifetime as monotonic non-decreasing
+            # (ICD §8.2). If we publish the bumped count to the read
+            # registers but a power cut hits before the async fsync lands,
+            # the post-reboot count is one lower than GenWatch last saw —
+            # a backwards jump that violates the contract. So the increment
+            # is persisted SYNCHRONOUSLY before the new snapshot becomes
+            # observable (see the critical_persist branch below).
+            critical_persist = False
             if transferred_to_gen:
                 new_last_to_gen = now_wall
                 new_lifetime = prev.transfer_count_lifetime + 1
                 self._transfer_timestamps.append(now_wall)
                 persist = True
+                critical_persist = True
             elif retransferred_to_util:
                 new_last_to_util = now_wall
                 persist = True
@@ -279,7 +289,14 @@ class RegisterStore:
             )
 
         if persist and self._state_file is not None:
-            self._persist_async_safe()
+            if critical_persist:
+                # Blocking fsync on the event loop: on the single-threaded
+                # loop this prevents the Modbus server from serving the new
+                # count until it is durable. Transfers are seconds-to-minutes
+                # apart, so the one-cycle stall is acceptable.
+                self._persist_sync()
+            else:
+                self._persist_async_safe()
 
     def apply_output_state(self, outputs: OutputState) -> None:
         """Apply a fresh output read. Snapshot-swap (no mutate-in-place)
@@ -536,6 +553,24 @@ class RegisterStore:
             self._save_blocking(persisted)
             return
         loop.run_in_executor(None, self._save_blocking, persisted)
+
+    def _persist_sync(self) -> None:
+        """Persist immediately (blocking fsync) before returning.
+
+        Used for durability-critical updates (the transfer_count_lifetime
+        increment) where the value must be on disk before it can be served
+        to GenWatch. On the production single-threaded event loop this
+        blocks the Modbus server for the fsync duration, which is exactly
+        the guarantee we want — no read observes a not-yet-durable count.
+        """
+        with self._lock:
+            persisted = PersistedState(
+                transfer_count_lifetime=self._snap.transfer_count_lifetime,
+                last_transfer_to_gen_ts=self._snap.last_transfer_to_gen_ts,
+                last_retransfer_to_util_ts=self._snap.last_retransfer_to_util_ts,
+                recent_transfer_wallclocks=list(self._transfer_timestamps),
+            )
+        self._save_blocking(persisted)
 
     def _save_blocking(self, persisted: PersistedState) -> None:
         try:

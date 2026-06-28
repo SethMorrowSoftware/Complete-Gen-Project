@@ -99,6 +99,29 @@ sed "s|^ExecStart=.*|ExecStart=$ATSPI_BIN --config $CONFIG_FILE|" \
   "$REPO_DIR/systemd/atspi.service" > "$UNIT_DST"
 systemctl daemon-reload
 
+# ── 6. Pi-level hardware watchdog (resets the Pi on a kernel/USB hang) ────────
+# The software watchdog (atspi.service WatchdogSec) can't restart pid 1. This
+# drop-in tells systemd to pet the SoC watchdog so a kernel deadlock hard-resets
+# the Pi. The ADAM host-watchdog (F1) releases the relays in the interim.
+HWWDT_SRC="$REPO_DIR/systemd/system.conf.d/10-atspi-hwwatchdog.conf"
+HWWDT_DST="/etc/systemd/system.conf.d/10-atspi-hwwatchdog.conf"
+if [ -f "$HWWDT_SRC" ]; then
+  say "Installing hardware-watchdog drop-in → $HWWDT_DST"
+  mkdir -p /etc/systemd/system.conf.d
+  install -m 0644 "$HWWDT_SRC" "$HWWDT_DST"
+  # Apply manager config without rebooting. daemon-reexec re-reads system.conf.d.
+  systemctl daemon-reexec || warn "daemon-reexec failed; reboot to arm the watchdog"
+  ARMED="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || echo '')"
+  if [ -n "$ARMED" ] && [ "$ARMED" != "0" ] && [ "$ARMED" != "infinity" ]; then
+    say "Hardware watchdog armed (RuntimeWatchdogUSec=$ARMED)"
+  else
+    warn "Hardware watchdog NOT armed yet (RuntimeWatchdogUSec=${ARMED:-unset})."
+    warn "  Verify /dev/watchdog exists (bcm2835_wdt) and reboot; check with 'wdctl'."
+  fi
+else
+  warn "hw-watchdog drop-in not found at $HWWDT_SRC — skipping (Pi won't self-reset on a kernel hang)"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 say "Install complete — the service is installed but NOT started (by design)."
 cat <<EOF

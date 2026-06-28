@@ -9,6 +9,33 @@ package version — see `atspi.ICD_VERSION` for the wire-protocol version.
 
 ## [Unreleased]
 
+### Fixed / hardened (post-audit safety pass, 2026-06)
+
+- **Transfer-count durability (M-4, ICD §8.2).** The `transfer_count_lifetime`
+  increment is now persisted **synchronously** before the bumped value becomes
+  observable over Modbus. Previously the count was published to the read
+  registers while the fsync was offloaded to the loop executor, so a power cut
+  in that window left the post-reboot count one lower than GenWatch last saw —
+  a backwards jump that violates the monotonicity contract. Routine (non-count)
+  persists are still offloaded.
+- **F1 fail-safe waiver now requires an explicit second acknowledgement (H-1).**
+  Setting `io.adam.require_hw_watchdog: false` removes the only software gate on
+  driving outputs; combined with a process death it can strand a latched relay.
+  The service now refuses to start unless `io.adam.i_understand_no_crash_backstop:
+  true` is also set — a one-line waiver can no longer silently remove the
+  crash-time backstop. `config.production.example.yaml` sets the ack (the 6060's
+  FSV/WDT isn't Modbus-readable).
+- **Pi-level hardware watchdog (H-1).** Added
+  `systemd/system.conf.d/10-atspi-hwwatchdog.conf` (and `install.sh` deploys +
+  verifies it) so a kernel/USB hang hard-resets the Pi — the software watchdog
+  can't restart pid 1. The companion is the device that physically commands the
+  switch and previously had no Pi-level watchdog (GenWatch did).
+- **systemd unit hardened (M-1, M-2).** `Restart=always` +
+  `StartLimitIntervalSec=0` (an unattended safety device must never latch in
+  `failed` requiring on-site `reset-failed`); `OOMScoreAdjust=-200` and memory/
+  task/fd caps; and `MemoryDenyWriteExecute` removed (it can SIGSYS-crash some
+  CPython builds — re-enable only after validating on the target image).
+
 ### Added (hybrid / serial commissioning — the Waveshare RS-485 path is now deployable)
 
 - **The `driver: hybrid` path (ADAM-6060 control + ASCO Group 5 read over a

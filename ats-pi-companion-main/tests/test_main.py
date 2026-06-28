@@ -265,6 +265,59 @@ def test_no_warning_when_site_unit_id_is_configured(caplog):
     assert not any("site.unit_id" in r.getMessage() for r in caplog.records)
 
 
+# ─── H-1: F1 fail-safe waiver requires an explicit second acknowledgement ─────
+
+
+def test_waiver_without_ack_refuses_to_start():
+    """require_hw_watchdog: false with no i_understand_no_crash_backstop ack
+    must hard-fail: a one-line waiver should not silently remove the last
+    crash-time backstop on the switch-command device.
+    """
+    import pytest
+
+    from atspi.__main__ import _enforce_hw_watchdog_waiver
+    from atspi.config import Config, ConfigError
+
+    cfg = Config()
+    cfg.io.driver = "adam"
+    cfg.io.adam.require_hw_watchdog = False
+    cfg.io.adam.i_understand_no_crash_backstop = False
+    with pytest.raises(ConfigError, match="i_understand_no_crash_backstop"):
+        _enforce_hw_watchdog_waiver(cfg)
+
+
+def test_waiver_with_ack_starts():
+    """The waiver is permitted once the operator sets the explicit ack key."""
+    from atspi.__main__ import _enforce_hw_watchdog_waiver
+    from atspi.config import Config
+
+    cfg = Config()
+    cfg.io.driver = "adam"
+    cfg.io.adam.require_hw_watchdog = False
+    cfg.io.adam.i_understand_no_crash_backstop = True
+    _enforce_hw_watchdog_waiver(cfg)  # must not raise
+
+
+def test_default_require_hw_watchdog_needs_no_ack():
+    """The safe default (require_hw_watchdog: true) never needs the ack, and
+    the mock driver is exempt regardless.
+    """
+    from atspi.__main__ import _enforce_hw_watchdog_waiver
+    from atspi.config import Config
+
+    cfg = Config()  # driver=mock, require_hw_watchdog=True
+    _enforce_hw_watchdog_waiver(cfg)
+
+    cfg.io.driver = "hybrid"  # require_hw_watchdog still True
+    _enforce_hw_watchdog_waiver(cfg)
+
+    cfg2 = Config()
+    cfg2.io.driver = "mock"
+    cfg2.io.adam.require_hw_watchdog = False  # mock is exempt
+    cfg2.io.adam.i_understand_no_crash_backstop = False
+    _enforce_hw_watchdog_waiver(cfg2)
+
+
 # ─── ICD §9.3: reset-on-reboot output release ────────────────────────────────
 
 
