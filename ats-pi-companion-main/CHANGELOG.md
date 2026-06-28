@@ -11,6 +11,17 @@ package version — see `atspi.ICD_VERSION` for the wire-protocol version.
 
 ### Fixed / hardened (post-audit safety pass, 2026-06)
 
+- **CRITICAL (C-1): the comms-loss auto-release is now scoped to GenWatch's
+  connection (ICD §3/§8.3).** The watchdog previously re-armed on *any*
+  successful Modbus read, so a diagnostic `modpoll`, a scanner, or a stale
+  second GenWatch on a separate connection could indefinitely suppress the
+  30 s auto-release of a latched force-transfer/inhibit. A `ConnectionTracker`
+  now identifies the authoritative connection as the one that issues command
+  writes (only GenWatch commands the switch; diagnostic tools read) — only that
+  connection's activity re-arms the watchdog, and a drop of that connection
+  triggers an immediate release. No wire-protocol change (ICD v1.0 unchanged).
+  New end-to-end tests (`test_c1_connection_scoping.py`) prove a busy
+  diagnostic reader cannot keep a latched command alive.
 - **Transfer-count durability (M-4, ICD §8.2).** The `transfer_count_lifetime`
   increment is now persisted **synchronously** before the bumped value becomes
   observable over Modbus. Previously the count was published to the read

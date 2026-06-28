@@ -298,7 +298,9 @@ async def _amain(args: argparse.Namespace) -> int:
         port=cfg.modbus_server.port,
         unit_id=cfg.modbus_server.unit_id,
         store=store,
-        on_read=watchdog.note_modbus_read,
+        # Scope the comms-loss watchdog to GenWatch's (the commanding)
+        # connection rather than re-arming on any client's reads (C-1, §8.3).
+        watchdog=watchdog,
         on_command=on_command,
     )
 
