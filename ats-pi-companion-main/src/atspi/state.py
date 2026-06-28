@@ -520,6 +520,19 @@ class RegisterStore:
             with self._lock:
                 if self._snap.mode_reject_active:
                     self._snap = replace(self._snap, mode_reject_active=False)
+        else:
+            # Known command register + permitted mode, but an out-of-pattern
+            # value (e.g. cmd_inhibit=2). pymodbus already ACKed the write at
+            # the wire (its validate() can't see the value — documented ICD §6
+            # deviation), so it is safely dropped with NO relay action. Log it
+            # loudly so a bench operator using modpoll/testadam doesn't mistake
+            # the ACK for an actuation (M-10).
+            log.warning(
+                "command write to %#06x has out-of-pattern value %#06x — "
+                "ignored, no relay action (expected 0x0001%s)",
+                addr, value,
+                "/0x0000" if addr in (ADDR_CMD_INHIBIT, ADDR_CMD_FORCE_TRANSFER) else "",
+            )
         return intent
 
     # ─── Internal helpers ─────────────────────────────────────────────

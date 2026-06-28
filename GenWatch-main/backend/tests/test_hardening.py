@@ -35,7 +35,7 @@ def app_env(monkeypatch, tmp_path):
 async def client(app_env):
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.2)
             yield c
@@ -1461,7 +1461,7 @@ async def test_login_cookie_auto_secure_on_https_request(app_env):
     """Auto-detect: an HTTPS-scheme request gets Secure for free."""
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="https://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="https://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})
@@ -1482,7 +1482,7 @@ async def test_cookie_secure_explicit_true_forces_secure_even_on_http(monkeypatc
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})
@@ -1502,7 +1502,7 @@ async def test_cookie_samesite_lax_override_applies(monkeypatch, tmp_path):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})
