@@ -395,6 +395,74 @@ async def test_sampling_loop_retries_startup_release_until_it_lands(monkeypatch)
 # ─── Sampling-loop failure-log throttling ────────────────────────────────────
 
 
+async def test_sense_failure_latches_input_fault_and_serves_last_good_position(monkeypatch):
+    """ICD §10 "reachable but blind": when the input/sense read fails (e.g. the
+    Group-5 RS-485 link drops) while the Modbus TCP server stays up, the
+    producer MUST (a) latch INPUT_FAULT in fault_summary AND (b) keep serving
+    its last-good position over the wire — not zeros, not 'unknown'. GenWatch
+    then drops the ATS-Pi as authoritative. This pins the producer half that a
+    regression (clearing the fault, or publishing a default snapshot in the
+    except branch) would silently break.
+    """
+    from atspi import __main__ as main_mod
+    from atspi.io_driver import InputSnapshot, OutputState
+    from atspi.state import (
+        ADDR_FAULT_SUMMARY,
+        ADDR_POSITION,
+        FAULT_INPUT,
+        RegisterStore,
+    )
+
+    monkeypatch.setattr(main_mod, "SAMPLE_INTERVAL_S", 0.01)
+
+    class Driver:
+        fail = False
+
+        async def read_inputs(self):
+            if self.fail:
+                raise OSError("Group-5 RS-485 read failed: TimeoutError")
+            return InputSnapshot(
+                position="generator", normal_available=False, emergency_available=True,
+                engine_start_calling=True, ats_mode="auto", fault_bits=0,
+            )
+
+        async def read_output_state(self):
+            return OutputState(False, False, False, False)
+
+        async def release_all_outputs(self):
+            pass
+
+        def check_output_consistency(self, _actual):
+            return True
+
+        def hw_watchdog_ok(self):
+            return True
+
+    driver = Driver()
+    store = RegisterStore()
+    task = asyncio.create_task(main_mod._sampling_loop(driver, store))
+    try:
+        # First, a few healthy cycles establish position=generator (=1).
+        await asyncio.sleep(0.05)
+        assert store.read_register(ADDR_POSITION) == 1
+        assert not (store.read_register(ADDR_FAULT_SUMMARY) & FAULT_INPUT)
+
+        # Now the sense link drops while the server keeps running.
+        driver.fail = True
+        await asyncio.sleep(0.1)  # ~10 failing cycles
+
+        # INPUT_FAULT is latched...
+        assert store.read_register(ADDR_FAULT_SUMMARY) & FAULT_INPUT, "INPUT_FAULT not set"
+        # ...and the last-good position is still served (not 0/utility, not unknown).
+        assert store.read_register(ADDR_POSITION) == 1, "last-good position not preserved"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 async def test_sampling_loop_throttles_repeated_failure_logs(caplog, monkeypatch):
     """A sustained ADAM outage must not flood the journal at ~10 lines/s: the
     first failure of a streak logs once, repeats are throttled, and recovery
