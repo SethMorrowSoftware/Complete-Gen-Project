@@ -1,0 +1,19 @@
+# Python build / virtualenv / cache artifacts (not source)
+.venv/
+venv/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
