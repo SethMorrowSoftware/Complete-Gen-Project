@@ -64,8 +64,10 @@ Normal ↔ Emergency, and watch the two contacts **swap**.
 On-Normal contact    →  one terminal → ADAM DI1 ,  other terminal → ADAM DI GND
 On-Emergency contact →  one terminal → ADAM DI2 ,  other terminal → ADAM DI GND
 ```
-The ADAM's **isolated inputs** read these cleanly alongside their existing wiring — **no relay, no
-extra parts.**
+The ADAM‑6060's inputs are **opto‑isolated, dry‑contact** (open = 1, shorted to DI‑common = 0), so
+they sense these contacts alongside the existing wiring without backfeeding — **as long as you
+confirmed the clean full open/close in 1a** (that rules out a parallel path). **No relay, no extra
+parts.**
 
 ---
 
@@ -121,7 +123,7 @@ io:
     host: "192.168.1.251"
     port: 502
     unit_id: 1
-    di_read: coils            # if position reads stuck/backwards, change to: discrete_inputs
+    di_read: coils            # if position stays 'unknown' / DIs read all-0, change to: discrete_inputs
     debounce_samples: 3
     assumed_mode: auto        # 'auto' = transfer commands allowed (required for control)
     require_hw_watchdog: false
@@ -151,7 +153,9 @@ systemctl status atspi        # expect: active (running)
 3. `sudo systemctl restart genwatch`.
 
 Use the **ATS control** buttons in GenWatch (those drive the ASCO through the companion). *The
-generator start/stop buttons write to the H‑100, which is monitor‑only here, so ignore them.*
+generator **start / stop / exercise / transfer** buttons write to the H‑100 — monitor‑only here —
+so ignore them. For load transfer use the **ATS → Force‑Transfer** button, which goes through the
+companion.*
 
 ---
 
