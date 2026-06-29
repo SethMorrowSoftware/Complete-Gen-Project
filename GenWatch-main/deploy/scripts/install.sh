@@ -93,6 +93,26 @@ retry() {
   done
 }
 
+# ─── Python interpreter selection ─────────────────────────────────────────
+# Build the venv from GENWATCH_PYTHON if set, else the system python3. The
+# hash-pinned wheels support CPython 3.9–3.14, so the default interpreter is
+# normally correct; the override is an escape hatch for hosts with several
+# pythons installed. We only enforce a lower bound (the app's floor).
+PY_MIN_MINOR=9
+py_minor() { "$1" -c 'import sys; print(sys.version_info[1])' 2>/dev/null; }
+py_works() { "$1" -c 'import sys' >/dev/null 2>&1; }
+
+select_python() {
+  local b="${GENWATCH_PYTHON:-python3}" mnr
+  command -v "$b" >/dev/null 2>&1 \
+    || { err "Python interpreter '$b' not found. Install python3 (+ python3-venv), or set GENWATCH_PYTHON to a valid one."; exit 1; }
+  mnr="$(py_minor "$b")"
+  if [[ "$mnr" =~ ^[0-9]+$ ]] && (( mnr < PY_MIN_MINOR )); then
+    err "'$b' is Python 3.${mnr}; GenWatch needs CPython >= 3.${PY_MIN_MINOR}."; exit 1
+  fi
+  echo "$b"
+}
+
 # ─── pre-flight ───────────────────────────────────────────────────────────
 require_root
 
@@ -231,9 +251,23 @@ log "Installing frontend bundle to $UI_DIR"
 rsync -a --delete "$REPO_ROOT/frontend/dist/" "$UI_DIR/"
 
 # ─── 5. Python venv + deps ────────────────────────────────────────────────
+PYTHON_BIN="$(select_python)"
+log "Python interpreter: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+
+# Recreate the venv if missing, or if its interpreter is gone/non-functional
+# (e.g. the base python it was built from was removed/upgraded out).
+if [[ -d "$APP_DIR/venv" ]] && ! py_works "$APP_DIR/venv/bin/python3"; then
+  warn "Existing venv at $APP_DIR/venv is broken (interpreter missing) — recreating."
+  rm -rf "$APP_DIR/venv"
+fi
 if [[ ! -d "$APP_DIR/venv" ]]; then
-  log "Creating virtualenv at $APP_DIR/venv"
-  python3 -m venv "$APP_DIR/venv"
+  log "Creating virtualenv at $APP_DIR/venv with $PYTHON_BIN"
+  if ! "$PYTHON_BIN" -m venv "$APP_DIR/venv" 2>/dev/null; then
+    warn "venv creation failed — ensuring ${PYTHON_BIN##*/}-venv is installed"
+    apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${PYTHON_BIN##*/}-venv" 2>/dev/null || true
+    "$PYTHON_BIN" -m venv "$APP_DIR/venv"
+  fi
 fi
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip wheel
 # Prefer the hash-pinned lockfile when present (Bookworm-fresh installs
