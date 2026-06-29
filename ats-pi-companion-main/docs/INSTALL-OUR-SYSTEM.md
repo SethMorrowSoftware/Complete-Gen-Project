@@ -51,10 +51,11 @@ The Generac/H‑100 stays exactly as it is — GenWatch keeps reading it for gen
 
 - ADAM‑6060 module (have it)
 - **24 VDC DIN‑rail power supply** (e.g. Mean Well DR‑30‑24) + an inline **1 A fuse**
-- **One small interposing relay with a 24 VDC coil and a NC (normally‑closed) contact** — for the
-  transfer wiring (explained in Part A). A changeover/SPDT relay works too (use its NC side).
-- *(Optional)* up to 3 more interposing relays if you also want Test / Inhibit / Bypass and/or if a
-  position signal turns out to be 120 VAC (Part B).
+- **One interposing relay** for the 8‑9 transfer wiring: a **24 VDC coil** + a **changeover (SPDT)
+  contact** (so it has COM / NC / NO — you'll use **COM + NC**). A plug‑in "ice‑cube" relay on a DIN
+  socket is easiest, e.g. **Finder 40.52** or **Omron MY2**, **24 VDC coil**. (Full wiring in Part A.2.)
+- *(Optional)* up to 3 more interposing relays only if a **position** signal turns out to be 120 VAC
+  (Part B). The Test / Inhibit / Bypass commands do **not** need extra relays.
 - Control wire (18 AWG), ferrules, labels
 - 3 Ethernet cables + the network switch
 - Laptop with the **Advantech Adam/Apax .NET Utility** (to set the ADAM's IP)
@@ -75,42 +76,101 @@ The Generac/H‑100 stays exactly as it is — GenWatch keeps reading it for gen
 
 ## Part A — Transfer control wiring (the main job)
 
-Our switch transfers when terminals **8–9 are opened** (that's what the Under‑Load toggle does). We
-add the ADAM **in series** with that toggle using one interposing relay, so **either** the manual
-toggle **or** GenWatch can open 8–9. We never parallel 8–9.
+### A.0 — How EVERY one of these connections works (read this once)
 
-### Wiring
+Each ASCO command is a **pair of terminals**, and the ASCO controller is watching for a **contact
+bridged across that pair**. An **ADAM relay is just a contact (a switch) with two terminals** — on
+your module they're labelled **RL0+ / RL0−**, **RL1+ / RL1−**, etc. To "press" a command you put
+**one ASCO terminal on each side of the relay**:
+
 ```
-ASCO 8 ──[ Normal/Under-Load toggle ]──[ interposing relay NC contact ]── ASCO 9
-
-   24 VDC + ──[ ADAM RL1 contact ]── interposing relay COIL ── 24 VDC −
+ASCO (first number)  ──────►  RLx +
+                                 ⌇   ← contact closes INSIDE the ADAM when the companion fires RLx
+ASCO (second number) ──────►  RLx −
 ```
 
-1. **Break into the 8–9 loop** and insert the interposing relay's **NC contact in series** with the
-   existing toggle. (8 → toggle → relay NC → 9.)
-2. **Drive the relay coil from ADAM RL1:** 24 VDC+ → ADAM **RL1** → relay coil → 24 VDC−.
+Two rules that matter:
+- **One wire to each side.** ASCO 6 on one terminal, ASCO 7 on the other — **never both on the same
+  terminal** (that would jam the command on permanently).
+- **Polarity doesn't matter** on these dry contacts: `+` and `−` are simply the two sides of the
+  switch, so 6→`+`/7→`−` is identical to 6→`−`/7→`+`.
 
-### How it behaves
-| Situation | Toggle | ADAM RL1 / relay | 8–9 | Result |
+### A.1 — The simple commands: Test / Inhibit / Bypass (optional)
+
+These three ASCO inputs are "**close to command**," so an ADAM relay drives each one **directly** —
+its two terminals straddle the ASCO pair. No toggle, no extra relay:
+
+| ADAM relay | `+` terminal → | `−` terminal → | ASCO function |
+|---|---|---|---|
+| **RL0** | ASCO **6** | ASCO **7** | **Test** (momentary start + test transfer) |
+| **RL2** | ASCO **10** | ASCO **11** | **Inhibit** transfer |
+| **RL3** | ASCO **12** | ASCO **13** | **Bypass** transfer time delay |
+
+Wire only the ones you want. Leave **RL4 / RL5 unused.** **Never** land anything on ASCO **14‑15‑16**
+(factory use).
+
+### A.2 — The transfer command on 8‑9 (the MAIN one — needs ONE extra relay)
+
+**Why 8‑9 is not wired like the others:**
+1. 8‑9 **transfers when it is OPENED**, not closed (your Normal/Under‑Load toggle opens it to
+   transfer).
+2. 8‑9 **already has the toggle** on it, and we must keep that working.
+3. The ADAM relay is **normally‑open** (it *closes* to command). To *open* a loop on command you need
+   a **normally‑closed** contact — which the ADAM doesn't have by itself.
+
+So we add **one small interposing relay**: the ADAM switches its **coil**, and the interposing
+relay's **normally‑closed (NC)** contact sits **in series** inside the 8‑9 loop, alongside the
+toggle. We do **not** wire RL1 onto 8‑9 directly, and we **never parallel** 8‑9.
+
+#### What you need (the extra relay)
+- **One interposing relay** with:
+  - a **24 VDC coil** (runs off the same 24 VDC supply as the ADAM), and
+  - a **changeover / SPDT contact** so it has **COM, NC, NO** terminals — you will use **COM + NC**.
+  - A **plug‑in ice‑cube relay on a DIN socket** is easiest (e.g. **Finder 40.52** or **Omron MY2**,
+    **24 VDC coil**).
+- The 8‑9 circuit is tiny (5 VDC / 5 mA), so any signal relay's contact is far more than enough.
+
+#### Wire it in two halves
+
+**HALF 1 — the coil (ADAM RL1 turns the interposing relay on/off):**
+```
+24 VDC (+) ───────────────────►  ADAM RL1 +
+ADAM RL1 − ───────────────────►  interposing-relay COIL (terminal A1)
+interposing-relay COIL (A2) ──►  24 VDC (−)
+```
+When the companion fires **RL1**, the ADAM contact closes, 24 V appears across the coil, and the
+interposing relay **energizes**. (Coil polarity doesn't matter on a DC ice‑cube relay; A1/A2 are
+just the two coil terminals.)
+
+**HALF 2 — the NC contact, inserted into the existing 8‑9 loop:**
+Today the loop is simply `ASCO 8 → toggle → ASCO 9`. **Break the wire between the toggle and ASCO 9**
+and route it through the relay's **COM → NC**:
+```
+ASCO 8 ─────────────►  toggle (one side)
+toggle (other side) ►  interposing-relay COM
+interposing-relay NC ► ASCO 9
+```
+The full loop becomes: **8 → toggle → COM →(NC contact)→ 9.**
+
+> Use only the relay's **COM** and **NC** terminals. **Do not use NO** — it would do the opposite.
+
+#### How it behaves
+| Situation | Toggle | Interposing relay (driven by RL1) | 8‑9 loop | Result |
 |---|---|---|---|---|
-| Normal | Normal (closed) | off → NC closed | closed | load on utility |
-| **Manual** transfer | **Under‑Load (open)** | off | open | transfer (operator) |
-| **GenWatch** transfer | Normal (closed) | **on** → NC opens | open | transfer (software) |
-| Power/comms lost | — | off → NC closes | closed | **auto‑returns to utility (safe)** |
+| Normal running | Normal (closed) | **off** → NC **closed** | closed | load on **utility** |
+| **Manual** transfer | **Under‑Load (open)** | off | open (at the toggle) | transfer — operator |
+| **GenWatch** transfer | Normal (closed) | **on** → NC **opens** | open (at the relay) | transfer — software |
+| Power / Pi / comms lost | any | off → NC **closed** | closed | **returns to utility automatically (safe)** |
 
-The manual toggle keeps working exactly as today. GenWatch gains transfer control on top of it. If
-anything loses power or the link drops, the relay releases and the load goes back to utility on its
-own.
+The manual toggle works exactly as before; GenWatch's transfer button now *also* opens the loop
+(RL1 → coil → NC opens). Anything that drops power or the network releases the relay, the NC closes,
+and the load falls back to utility on its own. **RL1 + this one interposing relay is the connection
+that gives your boss software transfer control.**
 
-### (Optional) the other commands
-These ASCO inputs are "close‑to‑command," so the ADAM relays drive them **directly** (no interposing
-relay, no toggle involved):
-- **ADAM RL0 → ASCO 6‑7** = Test (momentary start + test transfer)
-- **ADAM RL2 → ASCO 10‑11** = Inhibit transfer
-- **ADAM RL3 → ASCO 12‑13** = Bypass transfer time delay
-
-Wire only the ones you want. For the boss's "transfer," **RL1 on 8‑9 (above) is the one that
-matters.** Leave RL4/RL5 unused. Never touch ASCO 14‑15‑16 (factory use).
+#### Before you cut into 8‑9 — verify the toggle
+Meter it: continuity across the toggle should read **closed on "Normal"** and **open on
+"Under‑Load."** That confirms it's a simple series contact you can insert the relay's NC into. If it
+behaves differently (a multi‑pole/changeover doing something else), **stop and map it first.**
 
 ---
 
@@ -121,13 +181,22 @@ This lets GenWatch display "on utility / on generator." It needs two position si
 - **On‑Normal** signal → ADAM **DI1**
 - **On‑Emergency** signal → ADAM **DI2**
 
-**Find them and check what they are** (switch on Normal vs Generator, meter each):
-- **Dry contact** (continuity flips, ~0 V) → wire straight to the DI + DI‑common. No extra parts.
-- **10–30 VDC** (on/off with position) → wire straight to the DI (wet mode). No extra parts.
-- **120 VAC** → use one interposing relay per signal (relay NC/NO dry contact → DI), same idea as
-  Part A.
+Unlike the relays (two‑terminal switches), each **DI is read against the shared `DI GND` common.**
+So each position signal uses **two landings: the signal to a `DIn` terminal, and its return to
+`DI GND`:**
+```
+position signal  ──►  ADAM DI1   (On-Normal)   or   DI2 (On-Emergency)
+its return/0V    ──►  ADAM DI GND  (the shared input common)
+```
 
-Each signal: one leg to **DI1** (or DI2), the other to the **DI common** (`DI.GND`).
+**Find the signals and check what they are** (put the switch on Normal vs Generator, meter each):
+- **Dry contact** (continuity flips, ~0 V across it) → land it straight: one leg → `DI1`/`DI2`, other
+  leg → `DI GND`. No extra parts.
+- **10–30 VDC** (voltage present on one source, gone on the other) → land it straight (wet mode):
+  the `+` → `DI1`/`DI2`, the `0 V` → `DI GND`. No extra parts.
+- **120 VAC** → the ADAM can't read AC, so add **one interposing relay per signal**: the 120 VAC
+  drives the relay coil, and the relay's **dry contact** lands across `DIn` and `DI GND` (same trick
+  as Part A's relay, just feeding an input instead of an ASCO command).
 
 > Position is **recommended** (so a transfer is confirmed on screen) but the **transfer control in
 > Part A works without it.** If position signals are hard to get on day one, you can wire Part A,
