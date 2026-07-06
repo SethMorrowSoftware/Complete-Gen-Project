@@ -232,17 +232,24 @@ else
 fi
 
 if (( build_needed )); then
-  log "Building frontend bundle (this can take ~30 s on a Pi 4)"
+  log "Building frontend bundle (this can take ~30 s on a Pi 4 / small VM)"
   # `npm ci` (rather than `npm install`) requires package-lock.json,
   # refuses to write to it, and installs exactly the locked versions
-  # — reproducible builds across reinstalls and across customer Pis.
+  # — reproducible builds across reinstalls and across customer hosts.
   # `--ignore-scripts` blocks any pre/postinstall lifecycle scripts from
   # running (the installer is root). The build itself (`npm run build`)
   # still executes vite/esbuild, so we drop privileges to the invoking
   # user for the whole step when possible — npm is installed system-wide
   # by this script, so it's on every user's PATH.
+  #
+  # We deliberately do NOT pass `npm --silent`: npm's silent loglevel
+  # swallows even error output, so a failed `npm ci` (no network egress,
+  # or a cache-permission EACCES) previously aborted the whole installer
+  # with no explanation. Default loglevel keeps failures visible, and the
+  # explicit handler below turns them into actionable guidance.
+  build_ok=0
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] \
-       && sudo -u "$SUDO_USER" sh -c 'command -v npm' >/dev/null 2>&1; then
+       && sudo -u "$SUDO_USER" -H sh -c 'command -v npm' >/dev/null 2>&1; then
     log "Building frontend as $SUDO_USER (build tooling does not run as root)"
     # A prior root build (or an older installer that built as root) can
     # leave a root-owned node_modules *or* dist/ that blocks the
@@ -252,14 +259,39 @@ if (( build_needed )); then
     chown -R "$SUDO_USER" \
       "$REPO_ROOT/frontend/node_modules" \
       "$REPO_ROOT/frontend/dist" 2>/dev/null || true
-    sudo -u "$SUDO_USER" sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts --silent && npm run build"
+    # `-H` forces HOME to the build user's home so npm's cache lands in a
+    # writable ~/.npm rather than root's /root/.npm. Without it, `sudo -u`
+    # keeps HOME=/root on many distros (incl. Ubuntu), npm hits EACCES on
+    # the cache, and — combined with the old `--silent` — the installer
+    # exited silently right after this line.
+    if sudo -u "$SUDO_USER" -H sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts && npm run build"; then
+      build_ok=1
+    fi
   else
     warn "Building frontend as root — build-time deps run with full privileges. Run install.sh via 'sudo' from your normal user to drop them."
-    pushd "$REPO_ROOT/frontend" >/dev/null
-    npm ci --no-audit --no-fund --ignore-scripts --silent
-    npm run build
-    popd >/dev/null
+    if ( cd "$REPO_ROOT/frontend" && npm ci --no-audit --no-fund --ignore-scripts && npm run build ); then
+      build_ok=1
+    fi
   fi
+
+  if (( ! build_ok )); then
+    err "Frontend build failed. Common causes on a fresh server:"
+    err "  • no network egress to the npm registry (npm ci downloads packages)"
+    err "  • too little RAM for 'vite build' (needs ~1 GB free — add swap on a tiny VM)"
+    err "  • a stale root-owned node_modules/ or dist/ from an earlier root build"
+    err "Reproduce the exact step to see npm's error output:"
+    err "    sudo -u ${SUDO_USER:-\$USER} -H sh -c \"cd '$REPO_ROOT/frontend' && npm ci && npm run build\""
+    exit 1
+  fi
+fi
+
+# The UI install below copies dist/ verbatim — make sure the build
+# actually produced it before we rsync (a missing dist here otherwise
+# yields an empty /usr/share/genwatch/ui and a blank page much later).
+if [[ ! -f "$REPO_ROOT/frontend/dist/index.html" ]]; then
+  err "Frontend build produced no $REPO_ROOT/frontend/dist/index.html — cannot install the UI."
+  err "Build it manually to diagnose: (cd '$REPO_ROOT/frontend' && npm ci && npm run build)"
+  exit 1
 fi
 
 log "Installing frontend bundle to $UI_DIR"
