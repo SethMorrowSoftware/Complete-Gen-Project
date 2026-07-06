@@ -248,9 +248,16 @@ if (( build_needed )); then
   # with no explanation. Default loglevel keeps failures visible, and the
   # explicit handler below turns them into actionable guidance.
   build_ok=0
+  # Prefer building as the non-root invoking user (build tooling shouldn't
+  # run as root). That only works if that user can actually WRITE the
+  # checkout: a repo cloned via `sudo git clone` is root-owned, so the
+  # user can't even create frontend/node_modules (EACCES on mkdir). We
+  # re-own any prior build artifacts, then test writability, and fall back
+  # to a root build if the checkout isn't user-writable — rather than
+  # dead-ending an otherwise-fine install.
+  drop_user=""
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] \
        && sudo -u "$SUDO_USER" -H sh -c 'command -v npm' >/dev/null 2>&1; then
-    log "Building frontend as $SUDO_USER (build tooling does not run as root)"
     # A prior root build (or an older installer that built as root) can
     # leave a root-owned node_modules *or* dist/ that blocks the
     # unprivileged build: `npm ci` can't clean a root-owned node_modules,
@@ -259,16 +266,26 @@ if (( build_needed )); then
     chown -R "$SUDO_USER" \
       "$REPO_ROOT/frontend/node_modules" \
       "$REPO_ROOT/frontend/dist" 2>/dev/null || true
+    if sudo -u "$SUDO_USER" -H sh -c "test -w '$REPO_ROOT/frontend'"; then
+      drop_user="$SUDO_USER"
+    else
+      warn "$SUDO_USER cannot write $REPO_ROOT/frontend — the repo is owned by another user (cloned via 'sudo git clone'?)."
+      warn "Building as root instead. To keep build tooling unprivileged: sudo chown -R $SUDO_USER: '$REPO_ROOT' and re-run."
+    fi
+  fi
+
+  if [[ -n "$drop_user" ]]; then
+    log "Building frontend as $drop_user (build tooling does not run as root)"
     # `-H` forces HOME to the build user's home so npm's cache lands in a
     # writable ~/.npm rather than root's /root/.npm. Without it, `sudo -u`
     # keeps HOME=/root on many distros (incl. Ubuntu), npm hits EACCES on
     # the cache, and — combined with the old `--silent` — the installer
     # exited silently right after this line.
-    if sudo -u "$SUDO_USER" -H sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts && npm run build"; then
+    if sudo -u "$drop_user" -H sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts && npm run build"; then
       build_ok=1
     fi
   else
-    warn "Building frontend as root — build-time deps run with full privileges. Run install.sh via 'sudo' from your normal user to drop them."
+    warn "Building frontend as root — build-time deps run with full privileges ('npm ci --ignore-scripts' blocks lifecycle scripts)."
     if ( cd "$REPO_ROOT/frontend" && npm ci --no-audit --no-fund --ignore-scripts && npm run build ); then
       build_ok=1
     fi
@@ -276,11 +293,11 @@ if (( build_needed )); then
 
   if (( ! build_ok )); then
     err "Frontend build failed. Common causes on a fresh server:"
+    err "  • the repo is owned by another user — sudo chown -R ${SUDO_USER:-\$USER}: '$REPO_ROOT' and re-run"
     err "  • no network egress to the npm registry (npm ci downloads packages)"
     err "  • too little RAM for 'vite build' (needs ~1 GB free — add swap on a tiny VM)"
-    err "  • a stale root-owned node_modules/ or dist/ from an earlier root build"
-    err "Reproduce the exact step to see npm's error output:"
-    err "    sudo -u ${SUDO_USER:-\$USER} -H sh -c \"cd '$REPO_ROOT/frontend' && npm ci && npm run build\""
+    err "Reproduce to see npm's error output:"
+    err "    (cd '$REPO_ROOT/frontend' && npm ci && npm run build)"
     exit 1
   fi
 fi
