@@ -109,6 +109,20 @@ class Reading:
 TIER_STALE_MULTIPLIER = 3
 
 
+# Upper bound on the one-off "seed" base poll that start() runs so the UI
+# has data immediately. When the Modbus link is down or slow at boot, a
+# full base poll (many batches × retries × per-read connect timeouts) can
+# run for minutes. Because start() is awaited inside the service lifespan
+# *before* it sends sd_notify(READY=1), an unbounded seed poll blocks the
+# readiness signal past systemd's TimeoutStartSec and fails the start of a
+# service that is explicitly designed to come up degraded (comms LOST in
+# the UI, retry in the background). Bounding the seed poll — the base loop
+# re-polls immediately regardless — keeps startup prompt whether or not the
+# link is up. Well under the unit's TimeoutStartSec=60s, and applied per
+# Poller so the H-100 and ATS pollers together still finish comfortably.
+SEED_BASE_POLL_TIMEOUT_S = 10.0
+
+
 PollCallback = Callable[[str, Reading, CommsHealth], Awaitable[None]]
 
 
@@ -182,9 +196,23 @@ class Poller:
         if self._running:
             return
         self._running = True
-        # Kick off a base poll immediately so the UI has data even
-        # before the first base interval elapses.
-        await self._poll_tier("base")
+        # Kick off a base poll immediately so the UI has data even before the
+        # first base interval elapses — but bound it so a down/slow Modbus
+        # link at boot can't block the service lifespan's sd_notify(READY=1)
+        # past systemd's TimeoutStartSec. The base loop below re-polls
+        # immediately, so a timed-out seed just means "start degraded; the
+        # first base data lands on the next poll." (See SEED_BASE_POLL_TIMEOUT_S.)
+        try:
+            await asyncio.wait_for(
+                self._poll_tier("base"), timeout=SEED_BASE_POLL_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "initial base poll did not complete within %.0fs (Modbus link "
+                "down or slow?) — starting degraded; the poller keeps retrying "
+                "in the background.",
+                SEED_BASE_POLL_TIMEOUT_S,
+            )
         self._tasks = [
             asyncio.create_task(self._loop_prime(), name="poll-prime"),
             asyncio.create_task(self._loop_base(), name="poll-base"),

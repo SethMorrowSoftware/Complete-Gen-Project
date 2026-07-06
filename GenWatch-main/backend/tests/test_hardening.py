@@ -1564,3 +1564,54 @@ async def test_tcp_client_reports_failure_when_bridge_unreachable():
     r = await c.read(0x0001, 1)
     assert r.ok is False
     assert r.error  # some error string is set
+
+
+async def test_poller_start_is_bounded_when_link_hangs(monkeypatch):
+    """poller.start() must not block on the seed base poll when the Modbus
+    link is down/slow at boot.
+
+    The service lifespan awaits poller.start() *before* it sends
+    sd_notify(READY=1); an unbounded seed poll against an unreachable host
+    would blow systemd's TimeoutStartSec and fail the start of a service
+    that is designed to come up degraded. The seed poll is bounded by
+    SEED_BASE_POLL_TIMEOUT_S; the base loop keeps retrying afterwards.
+    """
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus import poller as poller_mod
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+
+    class HangingClient:
+        async def connect(self):
+            return True
+
+        async def close(self):
+            pass
+
+        async def read(self, addr, count, fc=3):
+            # Simulate an unreachable host — every read hangs well past the
+            # (patched) seed bound.
+            await asyncio.sleep(30)
+            return ModbusResult.failure("unreachable", 1.0)
+
+        async def write(self, *a, **kw):
+            return ModbusResult.failure("not_used")
+
+    async def cb(tier, reading, health):
+        pass
+
+    # Shrink the seed bound so the test is fast; start() should return
+    # ~immediately after it, not hang on the 30 s read.
+    monkeypatch.setattr(poller_mod, "SEED_BASE_POLL_TIMEOUT_S", 0.3)
+
+    p = Poller(HangingClient(), regmap, cb)
+    t0 = time.monotonic()
+    await p.start()
+    elapsed = time.monotonic() - t0
+    try:
+        assert elapsed < 5.0, f"start() blocked {elapsed:.1f}s — seed poll not bounded"
+        assert p._running is True
+    finally:
+        await p.stop()
