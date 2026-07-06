@@ -254,3 +254,41 @@ export interface SlackUpdate {
   alert_on_comms_lost?: boolean;
   alert_on_load_source_change?: boolean;
 }
+
+// Returned by GET /api/config.mqtt — the broker password is never
+// exposed; only a flag confirming it is set on disk.
+export interface MqttConfigView {
+  enabled: boolean;
+  host: string;
+  port: number;
+  topic: string;
+  payloadOn: string;
+  payloadOff: string;
+  qos: number;
+  retain: boolean;
+  username: string;
+  passwordConfigured: boolean;
+  clientId: string;
+  tls: boolean;
+  tlsInsecure: boolean;
+  publishOnStart: boolean;
+}
+
+// Sent in PUT /api/config.mqtt — omit a field to leave it unchanged.
+// Set password to "" to explicitly clear it.
+export interface MqttUpdate {
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  topic?: string;
+  payload_on?: string;
+  payload_off?: string;
+  qos?: number;
+  retain?: boolean;
+  username?: string;
+  password?: string;
+  client_id?: string;
+  tls?: boolean;
+  tls_insecure?: boolean;
+  publish_on_start?: boolean;
+}

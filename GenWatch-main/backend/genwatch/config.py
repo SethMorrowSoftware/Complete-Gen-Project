@@ -234,6 +234,69 @@ class SlackConfig(BaseModel):
     alert_on_load_source_change: bool = True
 
 
+class MqttConfig(BaseModel):
+    """MQTT publishing for the generator's load source.
+
+    When enabled, GenWatch publishes a small retained message to an MQTT
+    broker every time the load moves between utility and generator:
+
+      - load transfers to the generator → publish ``payload_on``  ("ON")
+      - load returns to utility          → publish ``payload_off`` ("OFF")
+
+    to ``topic`` (default ``facility/generator/status``). The message is
+    published *retained* so a home-automation / SCADA subscriber that
+    connects later immediately learns the current state without waiting
+    for the next transition.
+
+    The signal is the operator-visible *load source* — the same
+    utility↔generator transition that drives the Slack load-source alert
+    and the UI's ON UTILITY / ON GENERATOR indicator. It is driven by the
+    ATS-Pi's physical position when that companion is authoritative, and
+    by the H-100 electrical inference otherwise, so it works with or
+    without the ATS-Pi.
+
+    Disabled by default — sites without a broker see no change. The
+    publisher is fully independent and best-effort: a slow or unreachable
+    broker never blocks the Modbus poller, the API, or Slack.
+
+    Implemented against a broker with no new Python dependency (raw
+    MQTT 3.1.1 over a socket, mirroring the dependency-free Slack
+    notifier), so the hash-pinned offline install is unaffected.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 1883
+    # The status topic. "ON"/"OFF" are published here on load-source change.
+    topic: str = "facility/generator/status"
+    payload_on: str = "ON"       # published when the generator takes the load
+    payload_off: str = "OFF"     # published when the load returns to utility
+    # QoS 0 (at most once) or 1 (at least once, broker sends PUBACK). QoS 1
+    # is the default: a status transition is worth a delivery confirmation.
+    qos: Literal[0, 1] = 1
+    # Retain the last status on the broker so late subscribers see current
+    # state on connect. Correct default for a status topic.
+    retain: bool = True
+    # Optional broker auth. Empty username → anonymous connect.
+    username: str = ""
+    password: str = ""
+    # MQTT client id. Empty → a stable id derived from the site name at
+    # runtime (a fixed id lets the broker's session/ACLs track this client).
+    client_id: str = ""
+    # Wrap the connection in TLS (broker on 8883, typically). Uses the
+    # system trust store; set tls_insecure to skip cert verification only
+    # for a self-signed broker on a trusted LAN.
+    tls: bool = False
+    tls_insecure: bool = False
+    # Per-connect socket timeout (connect + each packet exchange).
+    timeout_s: float = 10.0
+    # Publish the boot-time load source too. Off by default so a restart
+    # while on utility doesn't emit a spurious "OFF"; the first real
+    # transition still publishes. Turn on if you want the retained topic
+    # seeded on every service start.
+    publish_on_start: bool = False
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GENWATCH_",
@@ -280,6 +343,7 @@ class Settings(BaseSettings):
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    mqtt: MqttConfig = Field(default_factory=MqttConfig)
     ats: AtsConfig = Field(default_factory=AtsConfig)
 
     # WebSocket push cadence — kept at prime poll by default per design

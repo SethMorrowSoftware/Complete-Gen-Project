@@ -173,7 +173,7 @@ sudo deploy/scripts/install.sh
 
 The installer is idempotent — safe to re-run for upgrades. It:
 
-1. Verifies you're root, on Bookworm or Trixie, on a Pi. Unsupported distros now error out (override with `GENWATCH_ALLOW_UNSUPPORTED_OS=1`); pre-Bookworm systemd silently rejects directives in the hwwatchdog drop-in, which previously failed quietly.
+1. Verifies you're root, on a supported OS — Raspberry Pi OS / Debian **Bookworm** or **Trixie**, or **Ubuntu Server 20.04+** (focal / jammy / noble). Other distros error out (override with `GENWATCH_ALLOW_UNSUPPORTED_OS=1`); pre-Bookworm / pre-20.04 systemd (< 243) silently rejects directives in the hwwatchdog drop-in, which previously failed quietly — the installer now also warns if the running systemd is older than 243 regardless of distro.
 2. Installs apt deps: `python3-venv`, `build-essential`, `nodejs` (>= 18), `npm`, `rsync`.
 3. Creates the `genwatch` system user.
 4. Builds the React/TypeScript frontend with `npm ci --ignore-scripts` (refuses to drift from the committed `package-lock.json`; blocks postinstall scripts from running under root) followed by `vite build` — ~10 s on Pi 5.
@@ -208,6 +208,25 @@ You should see something like:
 ```
 
 If you see `Modbus: NO RESPONSE`, jump to [§10 Troubleshooting](#10-troubleshooting). The installer continues regardless — the service just won't start until the admin password is set.
+
+### On an Ubuntu Server (TCP bridge)
+
+Ubuntu Server is a first-class target. `deploy/scripts/setup-ubuntu.sh` wraps the
+standard installer with an interactive, idempotent one-shot: it runs `install.sh`,
+then prompts for the H-100 gateway, the ATS-Pi companion, **MQTT status publishing**,
+and the admin password; writes `/etc/genwatch/config.yaml` (backing it up first);
+starts the service; and runs reachability + `genwatch doctor` checks. Safe to re-run.
+
+```bash
+git clone https://github.com/SethMorrowSoftware/GenWatch.git ~/GenWatch
+cd ~/GenWatch
+sudo deploy/scripts/setup-ubuntu.sh          # interactive; sensible defaults
+# non-interactive: every prompt has a matching env var, e.g.
+GW_HOST=10.0.0.5 MQTT_ENABLED=yes MQTT_HOST=10.0.0.9 sudo -E deploy/scripts/setup-ubuntu.sh
+```
+
+The plain `install.sh` also works directly on Ubuntu — `setup-ubuntu.sh` just adds
+the guided config step on top.
 
 ---
 
@@ -268,6 +287,49 @@ Log in with the password you set in §5.1.
 ### 5.4 Verify telemetry is live
 
 The Live view should populate within ~2 seconds with engine state, frequency, voltages, and currents from your H-100. The "Comms" badge in the top-right should be green and showing 100 % success. A red **STALE DATA** badge means the WebSocket dropped or no live update has arrived in ~3 poll intervals — see [§10](#10-troubleshooting).
+
+### 5.5 MQTT status publishing (optional)
+
+GenWatch can publish the generator's load status to an MQTT broker on every
+utility ↔ generator transition — ideal for home-automation, SCADA, or a facility
+dashboard:
+
+| Event | Message |
+|---|---|
+| load transfers to the generator | `ON`  → `facility/generator/status` |
+| load returns to utility          | `OFF` → `facility/generator/status` |
+
+The message is published **retained** (a subscriber that connects later immediately
+learns the current state) with QoS 1 by default. The signal is the same
+utility/generator load source shown in the UI and Slack: driven by the ATS-Pi's
+physical switch position when that companion is present and healthy, and by the
+H-100 electrical inference otherwise — so it works with or without the ATS-Pi.
+
+No extra software is required on the host — GenWatch speaks MQTT directly (no new
+Python dependency, so the hash-pinned offline install is unchanged). Point it at any
+broker (Mosquitto, EMQX, HiveMQ, Home Assistant's add-on…).
+
+Enable it in `/etc/genwatch/config.yaml` (or in **Settings → MQTT** in the UI, which
+hot-reloads without a restart):
+
+```yaml
+mqtt:
+  enabled: true
+  host: 127.0.0.1                    # broker host/IP
+  port: 1883                         # 8883 with tls: true
+  topic: facility/generator/status
+  payload_on: "ON"
+  payload_off: "OFF"
+  qos: 1                             # 0 or 1
+  retain: true
+  username: ""                       # blank = anonymous
+  password: ""                       # 0640 config perms keep it private
+  tls: false
+  publish_on_start: false            # seed the retained topic at boot
+```
+
+Verify from any subscriber, e.g. `mosquitto_sub -h <broker> -t facility/generator/status -v`,
+or use **Settings → MQTT → Send test** for a one-shot (non-retained) publish.
 
 ---
 
@@ -620,7 +682,7 @@ sudo systemctl restart genwatch
 
 ### Symptom: Install fails with `Unsupported OS tag`
 
-`install.sh` errors on anything older than Bookworm because pre-243 systemd silently rejects `RebootWatchdogSec` in the hwwatchdog drop-in, leaving shutdown unprotected. If you have a good reason to run on an older distro: `sudo GENWATCH_ALLOW_UNSUPPORTED_OS=1 deploy/scripts/install.sh` — accept that the hwwatchdog may not configure correctly.
+`install.sh` accepts Raspberry Pi OS / Debian Bookworm+ and Ubuntu Server 20.04+ (`ubuntu-*`), and errors on anything older because pre-243 systemd silently rejects `RebootWatchdogSec` in the hwwatchdog drop-in, leaving shutdown unprotected. If you have a good reason to run on an older/other distro: `sudo GENWATCH_ALLOW_UNSUPPORTED_OS=1 deploy/scripts/install.sh` — accept that the hwwatchdog may not configure correctly (the installer warns separately if the running systemd is older than 243).
 
 ### Symptom: Service restart-looping
 

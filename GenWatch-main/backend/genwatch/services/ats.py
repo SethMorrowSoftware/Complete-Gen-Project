@@ -35,6 +35,7 @@ from ..modbus.poller import CommsHealth, Reading
 from ..modbus.registers import RegisterMap
 
 if TYPE_CHECKING:
+    from .mqtt import MqttPublisher
     from .slack import SlackNotifier
     from .state import EventBus
 
@@ -164,12 +165,17 @@ class AtsService:
         db: Database,
         bus: "EventBus",
         slack: "SlackNotifier | None" = None,
+        mqtt: "MqttPublisher | None" = None,
         expected_unit_id: int | None = None,
     ):
         self.regmap = regmap
         self.db = db
         self.bus = bus
         self.slack = slack
+        # Optional MQTT publisher. When the ATS-Pi is the authoritative
+        # load source, its position change is the transition that drives
+        # the generator ON/OFF status topic (see _forward_to_mqtt).
+        self.mqtt = mqtt
         self.expected_unit_id = expected_unit_id
         self.snap = AtsSnapshot()
         # Used to detect ATS-Pi reboots (uptime jumping backwards).
@@ -469,6 +475,7 @@ class AtsService:
             except Exception as e:  # noqa: BLE001
                 log.exception("ats: bus publish failed: %s", e)
             await self._forward_to_slack(evt)
+            await self._forward_to_mqtt(evt)
 
     # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -780,6 +787,32 @@ class AtsService:
                 )
         except Exception as e:  # noqa: BLE001
             log.exception("ats: slack forward failed: %s", e)
+
+    async def _forward_to_mqtt(self, evt: dict[str, Any]) -> None:
+        """Publish generator ON/OFF status on an ATS position change.
+
+        When the ATS-Pi is authoritative, its physical position IS the
+        operator-visible load source, so a position change to 'generator'
+        or 'utility' is the utility↔generator transition the status topic
+        tracks. The 'transferring'/'unknown' intermediates are ignored,
+        and the boot-time 'unknown → utility' is never emitted by
+        _emit_position in the first place. Consecutive identical states
+        are deduped inside the publisher, so this coexists safely with the
+        H-100-derived path in main.py._forward_to_mqtt.
+        """
+        if self.mqtt is None or not self.mqtt.is_enabled():
+            return
+        if evt.get("type") != "ats-position":
+            return
+        new = str(evt.get("to", ""))
+        ts = float(evt.get("ts") or time.time())
+        try:
+            if new == "generator":
+                await self.mqtt.publish_generator_status(True, ts)
+            elif new == "utility":
+                await self.mqtt.publish_generator_status(False, ts)
+        except Exception as e:  # noqa: BLE001
+            log.exception("ats: mqtt forward failed: %s", e)
 
 
 # ─── Decoding helpers ────────────────────────────────────────────────────

@@ -56,6 +56,23 @@ async def get_config(
             "alertOnCommsLost": s.slack.alert_on_comms_lost,
             "alertOnLoadSourceChange": s.slack.alert_on_load_source_change,
         },
+        "mqtt": {
+            "enabled": s.mqtt.enabled,
+            "host": s.mqtt.host,
+            "port": s.mqtt.port,
+            "topic": s.mqtt.topic,
+            "payloadOn": s.mqtt.payload_on,
+            "payloadOff": s.mqtt.payload_off,
+            "qos": s.mqtt.qos,
+            "retain": s.mqtt.retain,
+            "username": s.mqtt.username,
+            # Never return the password itself; just confirm presence.
+            "passwordConfigured": bool(s.mqtt.password),
+            "clientId": s.mqtt.client_id,
+            "tls": s.mqtt.tls,
+            "tlsInsecure": s.mqtt.tls_insecure,
+            "publishOnStart": s.mqtt.publish_on_start,
+        },
         "wsPushMs": s.ws_push_ms,
     }
 
@@ -75,6 +92,24 @@ class SlackUpdate(BaseModel):
     alert_on_load_source_change: bool | None = None
 
 
+class MqttUpdate(BaseModel):
+    enabled: bool | None = None
+    host: str | None = None
+    port: int | None = None
+    topic: str | None = None
+    payload_on: str | None = None
+    payload_off: str | None = None
+    qos: int | None = None
+    retain: bool | None = None
+    username: str | None = None
+    # password: empty string clears, None preserves on-disk value.
+    password: str | None = None
+    client_id: str | None = None
+    tls: bool | None = None
+    tls_insecure: bool | None = None
+    publish_on_start: bool | None = None
+
+
 class ConfigUpdate(BaseModel):
     transport: str | None = None
     serial: dict | None = None
@@ -82,6 +117,7 @@ class ConfigUpdate(BaseModel):
     modbus: dict | None = None
     retention: dict | None = None
     slack: SlackUpdate | None = None
+    mqtt: MqttUpdate | None = None
     ws_push_ms: int | None = None
 
 
@@ -147,6 +183,14 @@ async def update_config(
             on_disk.setdefault("slack", {}).update(slack_patch)
             slack_changed = True
 
+    mqtt_changed = False
+    if body.mqtt is not None:
+        # Same rule as slack: only the fields sent; password == "" clears.
+        mqtt_patch = body.mqtt.model_dump(exclude_none=True)
+        if mqtt_patch:
+            on_disk.setdefault("mqtt", {}).update(mqtt_patch)
+            mqtt_changed = True
+
     # Atomic write: tmp -> rename
     tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,27 +198,48 @@ async def update_config(
         yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
     shutil.move(tmp, cfg_path)
 
-    # Slack settings hot-reload — no restart required.
+    # Slack + MQTT settings hot-reload — no restart required. Both are
+    # folded into a single settings.model_copy so a PUT touching both
+    # doesn't drop one update.
+    settings_updates: dict = {}
+
+    slack_for_audit = None
     if slack_changed:
         from ..config import SlackConfig
         # Sanitize what we audit (don't echo the token back to the audit log)
         slack_for_audit = {**slack_patch}
         if "bot_token" in slack_for_audit:
             slack_for_audit["bot_token"] = "<set>" if slack_for_audit["bot_token"] else "<cleared>"
-
         merged = {**s.slack.model_dump(), **slack_patch}
-        new_slack_cfg = SlackConfig(**merged)
-        new_settings = s.model_copy(update={"slack": new_slack_cfg})
+        settings_updates["slack"] = SlackConfig(**merged)
+
+    mqtt_for_audit = None
+    if mqtt_changed:
+        from ..config import MqttConfig
+        # Sanitize what we audit (don't echo the broker password)
+        mqtt_for_audit = {**mqtt_patch}
+        if "password" in mqtt_for_audit:
+            mqtt_for_audit["password"] = "<set>" if mqtt_for_audit["password"] else "<cleared>"
+        merged_m = {**s.mqtt.model_dump(), **mqtt_patch}
+        settings_updates["mqtt"] = MqttConfig(**merged_m)
+
+    if settings_updates:
+        new_settings = s.model_copy(update=settings_updates)
         request.app.state.settings = new_settings
-        notifier = getattr(request.app.state, "slack", None)
-        if notifier is not None:
-            notifier.update_config(new_slack_cfg)
-    else:
-        slack_for_audit = None
+        if slack_changed:
+            notifier = getattr(request.app.state, "slack", None)
+            if notifier is not None:
+                notifier.update_config(settings_updates["slack"])
+        if mqtt_changed:
+            publisher = getattr(request.app.state, "mqtt", None)
+            if publisher is not None:
+                publisher.update_config(settings_updates["mqtt"])
 
     audit_detail = body.model_dump(exclude_none=True)
     if "slack" in audit_detail and slack_for_audit is not None:
         audit_detail["slack"] = slack_for_audit
+    if "mqtt" in audit_detail and mqtt_for_audit is not None:
+        audit_detail["mqtt"] = mqtt_for_audit
     request.app.state.db.write_audit(p.operator, "config.update", str(audit_detail), "", "ok")
 
     # Slack-only changes don't require a restart; transport/serial/modbus do.
@@ -182,14 +247,15 @@ async def update_config(
         body.transport, body.serial, body.modbus_tcp, body.modbus, body.retention, body.ws_push_ms,
     ))
     log.info(
-        "config updated on disk by %s (slack=%s, restart_required=%s)",
-        p.operator, slack_changed, restart_required,
+        "config updated on disk by %s (slack=%s, mqtt=%s, restart_required=%s)",
+        p.operator, slack_changed, mqtt_changed, restart_required,
     )
     return {
         "ok": True,
         "configPath": str(cfg_path),
         "restart_required": restart_required,
         "slack_updated": slack_changed,
+        "mqtt_updated": mqtt_changed,
     }
 
 
@@ -211,6 +277,29 @@ async def test_slack(
     ok, detail = await notifier.test()
     request.app.state.db.write_audit(
         p.operator, "slack.test", detail if not ok else "", "", "ok" if ok else "failed"
+    )
+    return {"ok": ok, "detail": detail}
+
+
+@router.post("/mqtt/test")
+async def test_mqtt(
+    request: Request,
+    p: Principal = Depends(require_admin),
+) -> dict:
+    """Publish a one-shot (non-retained) test message to the MQTT broker.
+
+    Uses the current in-memory configuration (reflecting the most recent
+    PUT /api/config). Returns 200 with ``{ok, detail}`` even on failure so
+    the UI can surface the broker/connection error verbatim. The test
+    payload is NOT retained, so it doesn't clobber the real generator
+    status on the broker.
+    """
+    publisher = getattr(request.app.state, "mqtt", None)
+    if publisher is None:
+        raise HTTPException(503, "mqtt publisher not initialised")
+    ok, detail = await publisher.test()
+    request.app.state.db.write_audit(
+        p.operator, "mqtt.test", detail if not ok else "", "", "ok" if ok else "failed"
     )
     return {"ok": ok, "detail": detail}
 
