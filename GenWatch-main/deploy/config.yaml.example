@@ -134,6 +134,39 @@ slack:
   alert_on_comms_lost: true       # Modbus link lost / recovered
   alert_on_load_source_change: true   # utility ↔ generator load transitions
 
+# ─── MQTT status publishing ───────────────────────────────────────────────
+# When enabled, GenWatch publishes the generator's load status to an MQTT
+# broker on every utility ↔ generator transition:
+#
+#   load transfers to the generator → publish "ON"  to  facility/generator/status
+#   load returns to utility          → publish "OFF" to  facility/generator/status
+#
+# The message is published *retained*, so a home-automation / SCADA / dashboard
+# subscriber that connects later immediately learns the current state. The
+# signal is the same utility↔generator load source shown in the UI and Slack:
+# driven by the ATS-Pi's physical position when that companion is present and
+# healthy, and by the H-100 electrical inference otherwise (works either way).
+#
+# No extra software is needed on this host — GenWatch speaks MQTT directly.
+# Point it at any broker (Mosquitto, EMQX, HiveMQ, Home Assistant's add-on…).
+# MQTT settings can also be edited from Settings → Alerts in the UI (admin);
+# they hot-reload without a service restart.
+mqtt:
+  enabled: false
+  host: 127.0.0.1         # broker hostname or IP
+  port: 1883              # 1883 plain, 8883 for TLS
+  topic: facility/generator/status
+  payload_on: "ON"        # published when the generator takes the load
+  payload_off: "OFF"      # published when the load returns to utility
+  qos: 1                  # 0 = at most once, 1 = at least once (broker PUBACK)
+  retain: true            # keep last status on the broker for late subscribers
+  username: ""            # blank = anonymous connect
+  password: ""            # keep secret! config file mode is 0640
+  client_id: ""           # blank = a stable id derived from the site name
+  tls: false              # true to connect over TLS (typically port 8883)
+  tls_insecure: false     # skip cert verification (self-signed broker on a trusted LAN only)
+  publish_on_start: false # also seed the retained topic with current state at boot
+
 # WebSocket push cadence (ms). Leave at prime_poll_ms unless the UI
 # feels sluggish.
 ws_push_ms: 1500

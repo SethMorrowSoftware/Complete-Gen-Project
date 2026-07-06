@@ -42,6 +42,7 @@ from .services import notify
 from .services.ats import AtsService
 from .services.ats_control import AtsControlService
 from .services.control import ControlService
+from .services.mqtt import MqttPublisher
 from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
 from .services.slack import SlackNotifier
@@ -189,6 +190,11 @@ async def lifespan(app: FastAPI):
 
     bus = EventBus()
     slack = SlackNotifier(settings.slack, db, site_name=regmap.site.name)
+    # MQTT publisher — off by default. Publishes ON/OFF to the configured
+    # status topic (default facility/generator/status) on every
+    # utility↔generator load-source transition. Best-effort and fully
+    # independent: a slow/unreachable broker never blocks the poller.
+    mqtt = MqttPublisher(settings.mqtt, db, site_name=regmap.site.name)
 
     # ─── ATS-Pi companion (optional, see docs/integrations/ats-pi-icd.md) ──
     # Constructed BEFORE the StateMachine so the latter can hold a
@@ -226,7 +232,7 @@ async def lifespan(app: FastAPI):
                 settings.ats.host, settings.ats.port,
             )
         ats_service = AtsService(
-            ats_regmap, db, bus, slack=slack,
+            ats_regmap, db, bus, slack=slack, mqtt=mqtt,
             expected_unit_id=settings.ats.expected_unit_id,
         )
         ats_poller = Poller(ats_client, ats_regmap, ats_service.on_poll)
@@ -373,13 +379,17 @@ async def lifespan(app: FastAPI):
             await bus.publish(payload)
 
         # Fire transition/alarm events as separate messages, and forward
-        # them to Slack (best-effort — failures are logged, not raised).
+        # them to Slack + MQTT (best-effort — failures are logged, not raised).
         for evt in emitted:
             await bus.publish(evt)
             try:
                 await _forward_to_slack(slack, evt)
             except Exception as e:  # noqa: BLE001
                 log.exception("slack forward failed: %s", e)
+            try:
+                await _forward_to_mqtt(mqtt, evt)
+            except Exception as e:  # noqa: BLE001
+                log.exception("mqtt forward failed: %s", e)
 
     poller = Poller(client, regmap, on_poll)
     retention = RetentionService(db, settings.retention)
@@ -402,6 +412,7 @@ async def lifespan(app: FastAPI):
     app.state.poller = poller
     app.state.retention = retention
     app.state.slack = slack
+    app.state.mqtt = mqtt
     app.state.login_limiter = login_limiter
     app.state.command_limiter = command_limiter
     app.state.version = __version__
@@ -420,10 +431,33 @@ async def lifespan(app: FastAPI):
         boot_mode = f"live · serial {settings.serial.device}"
     db.write_event("info", "BOOT", f"Castle Generator Monitor v{__version__} starting", boot_mode)
     await slack.start()
+    await mqtt.start()
     await poller.start()
     if ats_poller is not None:
         await ats_poller.start()
     await retention.start()
+
+    # Optional MQTT boot-seed: publish the current load source once so the
+    # retained status topic reflects reality on a fresh start (default off).
+    # We wait for the first polls to firm up load_source rather than publish
+    # the boot-time 'unknown'. Runs regardless of ATS authority because it
+    # reads the final derived load_source, not a specific event path.
+    mqtt_seed_task: asyncio.Task | None = None
+    if settings.mqtt.publish_on_start and mqtt.is_enabled():
+        async def _seed_mqtt() -> None:
+            try:
+                for _ in range(30):
+                    await asyncio.sleep(0.5)
+                    ls = state_machine.snap.load_source
+                    if ls in ("utility", "generator"):
+                        await mqtt.publish_generator_status(ls == "generator")
+                        return
+                log.info("mqtt seed: load source still unknown after boot window — not seeding")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001
+                log.exception("mqtt seed failed: %s", e)
+        mqtt_seed_task = asyncio.create_task(_seed_mqtt(), name="mqtt-seed")
 
     # Signal systemd that we're ready, then start a watchdog ping task.
     # If systemd's WatchdogSec is unset (dev / non-systemd), both are no-ops.
@@ -499,6 +533,12 @@ async def lifespan(app: FastAPI):
                 await watchdog_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        if mqtt_seed_task is not None:
+            mqtt_seed_task.cancel()
+            try:
+                await mqtt_seed_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         # ATS-Pi stops BEFORE the H-100 — independent stack, finish
         # in opposite-of-startup order so any in-flight ATS event
         # publishing completes before the bus tears down.
@@ -509,6 +549,7 @@ async def lifespan(app: FastAPI):
         await poller.stop()
         await retention.stop()
         await slack.stop()
+        await mqtt.stop()
         await client.close()
         db.write_event("info", "BOOT", "Castle Generator Monitor stopped", None)
         db.close()
@@ -556,6 +597,35 @@ async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
             new=str(evt.get("to", "")),
             ts=ts,
         )
+
+
+async def _forward_to_mqtt(mqtt: MqttPublisher, evt: dict) -> None:
+    """Publish generator ON/OFF status on a load-source transition.
+
+    Handles the H-100-derived ``load-source`` event emitted by the state
+    machine. The ATS-Pi-derived ``ats-position`` event (which drives the
+    load source when the companion is authoritative) is forwarded from
+    services/ats.py on its own poll path — see AtsService._forward_to_mqtt.
+
+    - to == generator → ON  (the load moved to backup power)
+    - to == utility   → OFF (the load returned to utility)
+    The boot-time 'unknown → utility' firming is suppressed; seeding the
+    retained topic at startup is handled by the publish_on_start seed task.
+    Consecutive identical states are deduped inside the publisher.
+    """
+    if not mqtt.is_enabled():
+        return
+    if evt.get("type") != "load-source":
+        return
+    old = str(evt.get("from", ""))
+    new = str(evt.get("to", ""))
+    ts = float(evt.get("ts") or time.time())
+    if new == "generator":
+        await mqtt.publish_generator_status(True, ts)
+    elif new == "utility":
+        if old == "unknown":
+            return
+        await mqtt.publish_generator_status(False, ts)
 
 
 # UI reading transform is owned by api/status.py — see reading_to_ui.

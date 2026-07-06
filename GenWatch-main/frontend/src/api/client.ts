@@ -4,6 +4,7 @@ import type {
   ConfirmToken,
   EventRow,
   MeBody,
+  MqttUpdate,
   Reading,
   SlackUpdate,
   StatusBody,
@@ -180,17 +181,22 @@ export const api = {
     modbus?: any;
     retention?: any;
     slack?: SlackUpdate;
+    mqtt?: MqttUpdate;
     ws_push_ms?: number;
   }) =>
-    request<{ ok: boolean; restart_required: boolean; slack_updated?: boolean }>(
-      "/api/config",
-      {
-        method: "PUT",
-        body: JSON.stringify(body),
-      }
-    ),
+    request<{
+      ok: boolean;
+      restart_required: boolean;
+      slack_updated?: boolean;
+      mqtt_updated?: boolean;
+    }>("/api/config", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   testSlack: () =>
     request<{ ok: boolean; detail: string }>("/api/slack/test", { method: "POST" }),
+  testMqtt: () =>
+    request<{ ok: boolean; detail: string }>("/api/mqtt/test", { method: "POST" }),
   registers: () =>
     request<{
       path: string;

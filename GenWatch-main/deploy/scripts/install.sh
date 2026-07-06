@@ -124,7 +124,13 @@ log "Host:            $PI_MODEL"
 log "OS:              $OS_TAG"
 
 case "$OS_TAG" in
-  debian-bookworm|raspbian-bookworm|debian-trixie|raspbian-trixie)
+  debian-bookworm|raspbian-bookworm|debian-trixie|raspbian-trixie|ubuntu-*)
+    # Raspberry Pi OS / Debian Bookworm+ and Ubuntu Server are all
+    # first-class targets. Every supported Ubuntu LTS (20.04 focal /
+    # 22.04 jammy / 24.04 noble) ships systemd >= 245, which understands
+    # the RebootWatchdogSec hardware-watchdog drop-in. The systemd
+    # version guard below catches a genuinely-too-old release (e.g. an
+    # EOL Ubuntu 18.04) regardless of the codename.
     ;;
   *)
     # Pre-Bookworm distros ship systemd <243, which doesn't understand
@@ -137,12 +143,21 @@ case "$OS_TAG" in
     if [[ "${GENWATCH_ALLOW_UNSUPPORTED_OS:-0}" == "1" ]]; then
       warn "Unsupported OS tag '$OS_TAG' but GENWATCH_ALLOW_UNSUPPORTED_OS=1 — proceeding."
     else
-      err "Unsupported OS tag '$OS_TAG'. GenWatch supports Raspberry Pi OS / Debian Bookworm or Trixie."
+      err "Unsupported OS tag '$OS_TAG'. GenWatch supports Raspberry Pi OS / Debian Bookworm or Trixie, and Ubuntu Server (20.04+)."
       err "Set GENWATCH_ALLOW_UNSUPPORTED_OS=1 to override at your own risk (hardware watchdog may not configure correctly)."
       exit 1
     fi
     ;;
 esac
+
+# The hardware-watchdog drop-in uses RebootWatchdogSec, added in systemd
+# 243. Verify the running systemd is new enough regardless of distro so a
+# too-old release surfaces here rather than as a silently-inactive
+# watchdog discovered later in journalctl.
+SD_VER=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}')
+if [[ "$SD_VER" =~ ^[0-9]+$ ]] && (( SD_VER < 243 )); then
+  warn "systemd $SD_VER is older than 243 — the RebootWatchdogSec hardware-watchdog drop-in may be ignored on this host."
+fi
 
 if [[ "$PI_MODEL" != *"Raspberry Pi"* ]]; then
   warn "Host doesn't look like a Raspberry Pi ('$PI_MODEL'). Continuing anyway."

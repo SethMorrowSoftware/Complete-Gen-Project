@@ -58,6 +58,17 @@ if [[ "${ATS_ENABLED,,}" == y* ]]; then
   [[ "$ATS_UNIT" =~ ^[0-9]+$ ]] || die "expected_unit_id must be a number"
 fi
 
+# ── MQTT status publishing (optional) ────────────────────────────────────────
+# Publishes ON/OFF to a status topic on every utility↔generator transition.
+MQTT_ENABLED="$(ask "Publish generator status to an MQTT broker? (yes/no)" "${MQTT_ENABLED:-no}")"
+MQTT_HOST=""; MQTT_PORT=""; MQTT_TOPIC=""
+if [[ "${MQTT_ENABLED,,}" == y* ]]; then
+  MQTT_HOST="$(ask "  MQTT broker host/IP" "${MQTT_HOST:-127.0.0.1}")"
+  MQTT_PORT="$(ask "  MQTT broker port" "${MQTT_PORT:-1883}")"
+  is_port "$MQTT_PORT" || die "bad MQTT port: $MQTT_PORT"
+  MQTT_TOPIC="$(ask "  Status topic" "${MQTT_TOPIC:-facility/generator/status}")"
+fi
+
 # ── Admin password (no echo). Blank = leave whatever is already configured. ──
 ADMIN_PW="${ADMIN_PW:-}"
 if [ -z "$ADMIN_PW" ]; then
@@ -74,6 +85,7 @@ say "About to apply:"
 echo "    transport      -> tcp   ($GW_HOST:$GW_PORT, RTU framing)"
 echo "    modbus.slave   -> $SLAVE"
 [ -n "$ATS_HOST" ] && echo "    ats            -> $ATS_HOST:$ATS_PORT  expected_unit_id=$ATS_UNIT" || echo "    ats            -> disabled"
+[ -n "$MQTT_HOST" ] && echo "    mqtt           -> $MQTT_HOST:$MQTT_PORT  topic=$MQTT_TOPIC" || echo "    mqtt           -> disabled"
 echo "    admin password -> $( [ -n "$ADMIN_PW" ] && echo 'will be set' || echo 'unchanged' )"
 echo
 [ "$(ask "Proceed?" "yes")" = "yes" ] || die "aborted — nothing changed"
@@ -98,6 +110,7 @@ fi
 say "Configuring $CONFIG (a timestamped backup is saved alongside)…"
 GW_HOST="$GW_HOST" GW_PORT="$GW_PORT" SLAVE="$SLAVE" \
 ATS_ENABLED="$ATS_ENABLED" ATS_HOST="$ATS_HOST" ATS_PORT="$ATS_PORT" ATS_UNIT="$ATS_UNIT" \
+MQTT_ENABLED="$MQTT_ENABLED" MQTT_HOST="$MQTT_HOST" MQTT_PORT="$MQTT_PORT" MQTT_TOPIC="$MQTT_TOPIC" \
 ADMIN_HASH="$ADMIN_HASH" CONFIG="$CONFIG" \
 "$VENV_PY" - <<'PY'
 import os, time, shutil, yaml
@@ -122,6 +135,13 @@ if os.environ.get("ATS_ENABLED", "").lower().startswith("y"):
     a["framer"] = "socket"
     a.setdefault("slave", 1)
     a["expected_unit_id"] = int(os.environ["ATS_UNIT"])
+
+if os.environ.get("MQTT_ENABLED", "").lower().startswith("y"):
+    m = d.setdefault("mqtt", {})
+    m["enabled"] = True
+    m["host"] = os.environ["MQTT_HOST"]
+    m["port"] = int(os.environ["MQTT_PORT"])
+    m["topic"] = os.environ["MQTT_TOPIC"]
 
 h = os.environ.get("ADMIN_HASH", "")
 if h:
@@ -150,6 +170,9 @@ if command -v nc >/dev/null 2>&1; then
   if nc -z -w3 "$GW_HOST" "$GW_PORT" 2>/dev/null; then say "  gateway $GW_HOST:$GW_PORT ... OK"; else warn "  gateway $GW_HOST:$GW_PORT ... not reachable (bridge powered + raw-TCP/Always mode?)"; fi
   if [ -n "$ATS_HOST" ]; then
     if nc -z -w3 "$ATS_HOST" "$ATS_PORT" 2>/dev/null; then say "  ATS-Pi $ATS_HOST:$ATS_PORT ... OK"; else warn "  ATS-Pi $ATS_HOST:$ATS_PORT ... not reachable (powered + on the LAN + serving?)"; fi
+  fi
+  if [ -n "$MQTT_HOST" ]; then
+    if nc -z -w3 "$MQTT_HOST" "$MQTT_PORT" 2>/dev/null; then say "  MQTT broker $MQTT_HOST:$MQTT_PORT ... OK"; else warn "  MQTT broker $MQTT_HOST:$MQTT_PORT ... not reachable (broker running + listening?)"; fi
   fi
 else
   warn "  'nc' not installed — skipping socket checks (apt-get install -y netcat-openbsd to enable)."

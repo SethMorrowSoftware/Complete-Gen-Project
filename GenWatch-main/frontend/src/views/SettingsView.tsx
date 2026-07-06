@@ -7,9 +7,9 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
-import type { SlackConfigView, SlackUpdate } from "../types";
+import type { MqttConfigView, MqttUpdate, SlackConfigView, SlackUpdate } from "../types";
 
-type Section = "link" | "modbus" | "registers" | "retention" | "alerts";
+type Section = "link" | "modbus" | "registers" | "retention" | "alerts" | "mqtt";
 type Transport = "serial" | "tcp";
 
 interface Config {
@@ -22,12 +22,13 @@ interface Config {
   retention: { raw_days: number; rollup_1m_days: number; rollup_1h_days: number; audit_days: number };
   auth: { operatorName: string; sessionHours: number; passwordConfigured: boolean; jwtSecretConfigured: boolean };
   slack: SlackConfigView;
+  mqtt: MqttConfigView;
 }
 
 export function SettingsView() {
   const [section, setSection] = useState<Section>("link");
   const [cfg, setCfg] = useState<Config | null>(null);
-  const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate }>>({});
+  const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate; mqtt: MqttUpdate }>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +46,7 @@ export function SettingsView() {
     modbus: { ...cfg.modbus, ...(dirty.modbus || {}) },
     retention: { ...cfg.retention, ...(dirty.retention || {}) },
     slack: { ...cfg.slack, ...(dirty.slack || {}) },
+    mqtt: { ...cfg.mqtt, ...(dirty.mqtt || {}) },
   };
   const hasDirty = Object.keys(dirty).length > 0;
 
@@ -54,13 +56,14 @@ export function SettingsView() {
     setSaved(null);
     try {
       const r = await api.updateConfig(dirty as any);
+      const liveUpdated = [r.slack_updated && "Slack", r.mqtt_updated && "MQTT"].filter(Boolean).join(" + ");
       let message = "Saved.";
       if (r.restart_required) {
-        message = r.slack_updated
-          ? "Saved. Slack updated live · restart genwatch.service for link/modbus changes."
+        message = liveUpdated
+          ? `Saved. ${liveUpdated} updated live · restart genwatch.service for link/modbus changes.`
           : "Saved. Restart genwatch.service for changes to take effect.";
-      } else if (r.slack_updated) {
-        message = "Saved · Slack alerts updated live.";
+      } else if (liveUpdated) {
+        message = `Saved · ${liveUpdated} alerts updated live.`;
       }
       setSaved(message);
       setDirty({});
@@ -79,6 +82,7 @@ export function SettingsView() {
     { id: "registers", label: "Register Map", icon: "list" },
     { id: "retention", label: "Retention", icon: "history" },
     { id: "alerts", label: "Alerts · Slack", icon: "bell" },
+    { id: "mqtt", label: "MQTT", icon: "wave" },
   ];
 
   return (
@@ -144,6 +148,13 @@ export function SettingsView() {
               v={effective.slack}
               dirty={dirty.slack ?? {}}
               set={(patch) => setDirty((d) => ({ ...d, slack: { ...(d.slack || {}), ...patch } }))}
+            />
+          )}
+          {section === "mqtt" && (
+            <MqttSection
+              v={effective.mqtt}
+              dirty={dirty.mqtt ?? {}}
+              set={(patch) => setDirty((d) => ({ ...d, mqtt: { ...(d.mqtt || {}), ...patch } }))}
             />
           )}
         </div>
@@ -624,6 +635,188 @@ function SlackToggle({
     <div className="field-row">
       <div className="lbl">{label} <span className="desc">{desc}</span></div>
       <Switch value={!!value} onChange={onChange} />
+    </div>
+  );
+}
+
+function MqttSection({
+  v, dirty, set,
+}: {
+  v: MqttConfigView;
+  dirty: MqttUpdate;
+  set: (patch: MqttUpdate) => void;
+}) {
+  // Password UX mirrors the Slack bot token: never shown (we don't have it
+  // client-side); a "Configured" badge when the server reports one, an
+  // input to change it, and an empty string + Save to explicitly clear.
+  const pwWasSet = v.passwordConfigured;
+  const pwDirty = dirty.password !== undefined;
+  const [revealing, setRevealing] = useState(!pwWasSet);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
+
+  const runTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      setTestResult(await api.testMqtt());
+    } catch (e: any) {
+      setTestResult({ ok: false, detail: e?.body?.detail ?? e?.message ?? "test failed" });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="settings-head">
+        <h2>MQTT status publishing</h2>
+        <p>
+          Publish the generator's load status to an MQTT broker on every
+          utility ↔ generator transition: <span className="mono">{v.payloadOn || "ON"}</span> when the
+          generator takes the load and <span className="mono">{v.payloadOff || "OFF"}</span> when it
+          returns to utility, to <span className="mono">{v.topic || "facility/generator/status"}</span>.
+          Published retained so late subscribers see current state. GenWatch speaks MQTT
+          directly — no extra software on this host. Changes apply immediately — no restart.
+        </p>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Enabled <span className="desc">master switch</span></div>
+        <Switch value={!!v.enabled} onChange={(b) => set({ enabled: b })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Broker host <span className="desc">hostname or IP of the MQTT broker</span></div>
+        <input className="input" placeholder="127.0.0.1" value={v.host}
+               onChange={(e) => set({ host: e.target.value })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Port <span className="desc">1883 plain · 8883 TLS</span></div>
+        <input className="input" type="number" value={v.port}
+               onChange={(e) => set({ port: Number(e.target.value) })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Topic <span className="desc">status is published here, retained</span></div>
+        <input className="input mono" placeholder="facility/generator/status" value={v.topic}
+               onChange={(e) => set({ topic: e.target.value })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Payloads <span className="desc">on-generator · on-utility</span></div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <input className="input mono" placeholder="ON" value={v.payloadOn}
+                 onChange={(e) => set({ payload_on: e.target.value })} />
+          <input className="input mono" placeholder="OFF" value={v.payloadOff}
+                 onChange={(e) => set({ payload_off: e.target.value })} />
+        </div>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">QoS <span className="desc">delivery guarantee</span></div>
+        <select className="select" value={v.qos} onChange={(e) => set({ qos: Number(e.target.value) })}>
+          <option value={0}>0 — at most once (fire and forget)</option>
+          <option value={1}>1 — at least once (broker PUBACK)</option>
+        </select>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Retain <span className="desc">keep last status on the broker for late subscribers</span></div>
+        <Switch value={!!v.retain} onChange={(b) => set({ retain: b })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Publish on start <span className="desc">seed the topic with current state at boot</span></div>
+        <Switch value={!!v.publishOnStart} onChange={(b) => set({ publish_on_start: b })} />
+      </div>
+
+      <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <h2 style={{ fontSize: 13 }}>Authentication &amp; transport</h2>
+        <p>Leave username blank for an anonymous broker. Enable TLS for brokers on 8883.</p>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Username <span className="desc">blank = anonymous</span></div>
+        <input className="input" autoComplete="off" value={v.username}
+               onChange={(e) => set({ username: e.target.value })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Password <span className="desc">stored on disk; never returned by API</span></div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {!revealing && pwWasSet ? (
+            <div className="flex ai-c gap-8">
+              <Pill tone="ok">Configured</Pill>
+              <button className="btn btn-ghost" onClick={() => { setRevealing(true); set({ password: "" }); }}>
+                Change…
+              </button>
+            </div>
+          ) : (
+            <>
+              <input className="input mono" type="password" autoComplete="off" spellCheck={false}
+                     placeholder="broker password"
+                     value={dirty.password ?? ""}
+                     onChange={(e) => set({ password: e.target.value })} />
+              {pwDirty && (
+                <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+                  {dirty.password === ""
+                    ? "Save with an empty value to clear the password."
+                    : "Password will be saved to /etc/genwatch/config.yaml."}
+                </div>
+              )}
+              {pwWasSet && (
+                <button className="btn btn-ghost" style={{ alignSelf: "flex-start" }}
+                        onClick={() => { setRevealing(false); set({ password: undefined as any }); }}>
+                  Keep existing password
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Client ID <span className="desc">blank = derived from site name</span></div>
+        <input className="input mono" autoComplete="off" value={v.clientId}
+               onChange={(e) => set({ client_id: e.target.value })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">TLS <span className="desc">connect over TLS (typically port 8883)</span></div>
+        <Switch value={!!v.tls} onChange={(b) => set({ tls: b })} />
+      </div>
+
+      {v.tls && (
+        <div className="field-row">
+          <div className="lbl">Skip cert check <span className="desc">self-signed broker on a trusted LAN only</span></div>
+          <Switch value={!!v.tlsInsecure} onChange={(b) => set({ tls_insecure: b })} />
+        </div>
+      )}
+
+      <div className="field-row" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <div className="lbl">Test publish
+          <span className="desc">publishes a one-shot, non-retained message to the topic</span></div>
+        <div className="flex ai-c gap-8">
+          <button className="btn" disabled={testing || !v.enabled || !v.host || !v.topic} onClick={runTest}>
+            {testing ? "Publishing…" : "Send test"}
+          </button>
+          {testResult && (
+            <Pill tone={testResult.ok ? "ok" : "alarm"}>
+              {testResult.ok ? "Published" : testResult.detail}
+            </Pill>
+          )}
+        </div>
+      </div>
+      {!v.enabled && (
+        <div style={{
+          marginTop: 8, padding: 10, borderRadius: 7, fontSize: 12,
+          background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-3)",
+        }}>
+          Enable MQTT and save, then the Send test button activates.
+        </div>
+      )}
     </div>
   );
 }
