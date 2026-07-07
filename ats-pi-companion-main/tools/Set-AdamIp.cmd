@@ -37,20 +37,21 @@ echo    Set ADAM-6060 IP:   %CURRENT%   -^>   %NEWIP%
 echo   ================================================================
 echo(
 
-rem --- Find the wired adapter (ask if we can't) -------------------------------
-set "IF="
-for /f "delims=" %%A in ('powershell -NoProfile -Command "$a=Get-NetAdapter -Physical ^| Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Wi-?Fi^|Wireless^|Bluetooth^|Virtual^|Loopback'} ^| Select-Object -First 1 -ExpandProperty Name; if($a){$a}"') do set "IF=%%A"
-if not defined IF (
-  echo Could not auto-detect a wired adapter that is plugged in.
-  echo Open Network Connections ^(run: ncpa.cpl^) to see the exact name.
-  set /p IF="Type your Ethernet adapter name exactly: "
-)
-if not defined IF ( echo No adapter given - aborting. & pause & exit /b 1 )
+rem --- Pick the wired adapter from netsh's own list (rock-solid, no quoting) --
+echo Your network interfaces:
+echo(
+netsh interface show interface
+echo(
+echo Look above for the WIRED adapter whose State is "Connected" - usually
+echo named "Ethernet". Type its exact Interface Name ^(or press Enter for
+echo the default^). If Wi-Fi is also "Connected", turn it OFF first so the
+echo checks don't route around the wired link.
+echo(
+set "IF=Ethernet"
+set /p "IF=Wired adapter name [default: Ethernet]: "
+if not defined IF set "IF=Ethernet"
+echo(
 echo Using wired adapter: "!IF!"
-
-rem --- Warn if Wi-Fi is up (it can route around the wired NIC) ----------------
-for /f "delims=" %%W in ('powershell -NoProfile -Command "$w=Get-NetAdapter -Physical ^| Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -match 'Wi-?Fi^|Wireless'} ^| Select-Object -First 1 -ExpandProperty Name; if($w){$w}"') do set "WIFI=%%W"
-if defined WIFI echo NOTE: Wi-Fi "!WIFI!" is on. If checks fail, turn Wi-Fi off and re-run.
 
 echo(
 echo This changes the IPv4 settings on "!IF!". If that is your only network
