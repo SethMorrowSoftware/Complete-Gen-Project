@@ -886,6 +886,14 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
   const gal = Math.round(fuel * (status.site.tankGal / 100));
   const coolLevel = r.coolLevel;
   const lowCool = coolLevel != null && coolLevel < 50;
+  // Clamp the bar fill to its track. A percentage register whose scale is
+  // wrong for a given panel revision (coolant_level reads tenths on ours —
+  // see registers/h100.yaml) would otherwise paint a 772%-wide bar straight
+  // out of its container. The numeric readout stays unclamped: if the value
+  // is wrong, the operator should SEE that it's wrong rather than have the
+  // UI quietly launder it into a plausible-looking 100%.
+  const coolBarPct = Math.max(0, Math.min(100, coolLevel ?? 0));
+  const fuelBarPct = Math.max(0, Math.min(100, fuel));
   // Sub-label adapts to fuel type — diesel sites have a local tank we
   // can quantify in gallons; gaseous sites typically have a utility
   // gas connection where the "tank" volume is less meaningful, but we
@@ -905,7 +913,7 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
           </span>
         </div>
         <div className="fuel-bar">
-          <i style={{ width: `${coolLevel ?? 0}%`, background: lowCool ? "linear-gradient(90deg, var(--amber), var(--red))" : "linear-gradient(90deg, var(--blue), color-mix(in oklch, var(--blue) 70%, var(--green)))" }} />
+          <i style={{ width: `${coolBarPct}%`, background: lowCool ? "linear-gradient(90deg, var(--amber), var(--red))" : "linear-gradient(90deg, var(--blue), color-mix(in oklch, var(--blue) 70%, var(--green)))" }} />
           <div className="ticks">
             {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
           </div>
@@ -920,7 +928,7 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
           </span>
         </div>
         <div className="fuel-bar">
-          <i style={{ width: `${fuel}%` }} data-low={lowFuel ? "1" : "0"} />
+          <i style={{ width: `${fuelBarPct}%` }} data-low={lowFuel ? "1" : "0"} />
           <div className="ticks">
             {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
           </div>

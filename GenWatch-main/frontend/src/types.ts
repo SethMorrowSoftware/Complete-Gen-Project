@@ -281,6 +281,15 @@ export interface SlackConfigView {
   mentionOnReturnToUtility: string;
   loadSourceDebounceS: number;
   // Sign-in / account security alerts.
+  // Fuel alerts — thresholds live in FuelConfigView, these only decide
+  // which fuel events reach Slack.
+  alertOnFuelWarning: boolean;
+  alertOnFuelCritical: boolean;
+  alertOnFuelReminder: boolean;
+  alertOnFuelRecovered: boolean;
+  alertOnFuelDrop: boolean;
+  channelFuel: string;
+  mentionOnFuelCritical: string;
   alertOnLoginFailure: boolean;
   alertOnAccountLockout: boolean;
   alertOnLoginSuccess: boolean;
@@ -309,6 +318,13 @@ export interface SlackUpdate {
   mention_on_transfer_to_generator?: string;
   mention_on_return_to_utility?: string;
   load_source_debounce_s?: number;
+  alert_on_fuel_warning?: boolean;
+  alert_on_fuel_critical?: boolean;
+  alert_on_fuel_reminder?: boolean;
+  alert_on_fuel_recovered?: boolean;
+  alert_on_fuel_drop?: boolean;
+  channel_fuel?: string;
+  mention_on_fuel_critical?: string;
   alert_on_login_failure?: boolean;
   alert_on_account_lockout?: boolean;
   alert_on_login_success?: boolean;
@@ -352,4 +368,36 @@ export interface MqttUpdate {
   tls?: boolean;
   tls_insecure?: boolean;
   publish_on_start?: boolean;
+}
+
+// Returned by GET /api/config.fuel. tankGal / fuelType come from the
+// register map rather than config.yaml — the UI needs them to show
+// gallons and to explain why a gaseous site never alerts.
+export interface FuelConfigView {
+  enabled: boolean;
+  warn_pct: number;
+  critical_pct: number;
+  hysteresis_pct: number;
+  renotify_hours: number;
+  min_valid_pct: number;
+  max_valid_pct: number;
+  drop_alert_pct: number;
+  drop_window_minutes: number;
+  drop_only_when_stopped: boolean;
+  tankGal: number;
+  fuelType: "diesel" | "gaseous" | "unknown";
+}
+
+// Sent in PUT /api/config.fuel — omit a field to leave it unchanged.
+export interface FuelUpdate {
+  enabled?: boolean;
+  warn_pct?: number;
+  critical_pct?: number;
+  hysteresis_pct?: number;
+  renotify_hours?: number;
+  min_valid_pct?: number;
+  max_valid_pct?: number;
+  drop_alert_pct?: number;
+  drop_window_minutes?: number;
+  drop_only_when_stopped?: boolean;
 }

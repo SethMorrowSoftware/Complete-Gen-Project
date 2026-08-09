@@ -206,3 +206,40 @@ def test_validate_register_map_control_read_share_is_warning():
     report = validate_register_map(rm)
     assert report.ok
     assert any("shares address" in w for w in report.warnings)
+
+
+def test_coolant_level_decodes_in_tenths_of_a_percent():
+    """Field-verified against the H-100 LCD: raw 772 is 77.2%, not 772%.
+
+    This scale has been flipped once already on a plausible-sounding
+    theory (genmon reads the same register raw), which put "772.0 %" on
+    the dashboard, overran the coolant bar, and made the low-coolant
+    indicator unreachable. Pin it to the panel reading so the next person
+    reasoning from another codebase's decode has to argue with a test.
+    """
+    rm = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+    reg = rm.by_name("coolant_level")
+    assert reg is not None
+    assert reg.scale == 0.1
+
+    # u32_lo takes the low word; 772 raw → 77.2%.
+    assert decode_value(reg, [0x0000, 772]) == pytest.approx(77.2)
+    # And a genuinely low tank stays low rather than being laundered into
+    # a healthy-looking 95%.
+    assert decode_value(reg, [0x0000, 95]) == pytest.approx(9.5)
+
+
+def test_percentage_registers_decode_inside_their_unit():
+    """Any register declared `unit: pct` should produce a plausible
+    percentage from a mid-scale raw reading. Catches a scale that is off
+    by a decade — the failure mode that put 772% on the dashboard."""
+    rm = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+    for reg in rm.registers:
+        if (reg.unit or "").lower() != "pct":
+            continue
+        # A raw reading near the top of the sensor's plausible range must
+        # not decode above 100%.
+        raw = 1000 if reg.scale == 0.1 else 100
+        words = [0x0000, raw] if reg.words == 2 else [raw]
+        value = decode_value(reg, words)
+        assert 0 <= value <= 100, f"{reg.name}: raw {raw} decodes to {value}%"

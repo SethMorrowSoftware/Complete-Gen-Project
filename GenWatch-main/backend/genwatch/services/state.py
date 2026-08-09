@@ -123,10 +123,22 @@ class StateMachine:
         db: Database,
         bus: "EventBus",
         ats_service: "AtsService | None" = None,
+        fuel_cfg=None,
     ):
         self.regmap = regmap
         self.db = db
         self.bus = bus
+        # Fuel-level monitoring (low-tank tiers + abnormal-drop detection).
+        # Disabled unless fuel.enabled is set; see services/fuel.py for why
+        # it doesn't ride on the numeric-range alarms.
+        from ..config import FuelConfig
+        from .fuel import FuelMonitor
+
+        self.fuel = FuelMonitor(
+            cfg=fuel_cfg if fuel_cfg is not None else FuelConfig(),
+            tank_gal=regmap.site.tank_gal,
+            fuel_type=regmap.site.fuel_type,
+        )
         # Optional ATS-Pi companion service. When present and reporting
         # healthy comms, its `position` is used as the authoritative
         # loadSource instead of the H-100-derived value (ICD §10).
@@ -439,6 +451,12 @@ class StateMachine:
         if self._numeric_raised:
             self.snap.active_alarms = self.snap.active_alarms | set(self._numeric_raised)
 
+        # Fuel level. Evaluated on every poll regardless of engine state —
+        # unlike the numeric-range bands above, which only apply while the
+        # engine is producing. A tank running dry matters most while the
+        # generator is stopped and there is still time to do something.
+        self._check_fuel(reading, emitted)
+
         # Comms transition logging + event
         if comms.state != self.snap.comms.state:
             old_comms = self.snap.comms.state
@@ -524,6 +542,49 @@ class StateMachine:
         self.snap.comms = comms
         self.snap.last_reading = reading
         return emitted
+
+    def _check_fuel(self, reading: Reading, emitted: list[dict[str, Any]]) -> None:
+        """Run the fuel monitor and turn its decisions into events.
+
+        The monitor owns the thresholds, hysteresis, reminder timing and
+        drop detection (services/fuel.py); this just feeds it the current
+        reading and records whatever it decides to say. A no-op when
+        ``fuel.enabled`` is false or the site burns gaseous fuel.
+        """
+        if not self.fuel.is_applicable():
+            return
+        try:
+            fuel_events = self.fuel.update(
+                pct=reading.values.get("fuel_level_pct"),
+                engine_state=self.snap.engine_state,
+            )
+        except Exception as e:  # noqa: BLE001 — never let fuel break the poll
+            log.exception("fuel monitor failed: %s", e)
+            return
+
+        for fe in fuel_events:
+            self.db.write_event(
+                severity=fe.severity,
+                type_="FUEL",
+                message=fe.message,
+                meta=f"pct={fe.pct:.1f} status={fe.status}",
+            )
+            emitted.append({
+                "type": "fuel",
+                "kind": fe.kind,
+                "status": fe.status,
+                "from": fe.previous,
+                "pct": round(fe.pct, 1),
+                "gallons": self.fuel.gallons(fe.pct),
+                "droppedPct": fe.dropped_pct,
+                "windowMinutes": fe.window_minutes,
+                "severity": fe.severity,
+                "desc": fe.message,
+                "ts": time.time(),
+            })
+            log.warning("Fuel: %s", fe.message) if fe.severity != "ok" else log.info(
+                "Fuel: %s", fe.message
+            )
 
     # ─── Load-source disagreement (ATS vs H-100 cross-check) ──────────
 

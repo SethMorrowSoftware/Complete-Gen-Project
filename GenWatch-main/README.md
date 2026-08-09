@@ -6,7 +6,7 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and a production boot with no usable admin account refuse to start; per-operator accounts with roles, server-side revocable sessions, per-IP *and* per-account brute-force limits, optional TOTP, and a `security.public_exposure` gate that refuses an unsafe internet-facing config; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (395 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and a production boot with no usable admin account refuse to start; per-operator accounts with roles, server-side revocable sessions, per-IP *and* per-account brute-force limits, optional TOTP, and a `security.public_exposure` gate that refuses an unsafe internet-facing config; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (426 tests).
 
 ---
 
@@ -390,6 +390,47 @@ repeatedly, otherwise produces a burst of contradictory pages during the exact
 minutes you need a clear signal — and a flap that lands back where it started sends
 nothing at all. The message names where the load actually settled.
 
+**Fuel alerts** are opt-in, because `fuel_level_pct` (0x0092) isn't verified on
+every H-100 revision — confirm it against the panel with
+`sudo -u genwatch genwatch panel | grep fuel` first. A reading outside 0–100% is
+treated as a sensor fault and stays silent rather than paging "FUEL EMPTY" off an
+unconfigured register.
+
+```yaml
+fuel:
+  enabled: true
+  warn_pct: 25            # "order fuel this week"
+  critical_pct: 10        # "you have hours of runtime left"
+  hysteresis_pct: 3       # a tank on a running genset sloshes
+  renotify_hours: 12      # keep saying it while the tank is still low
+  drop_alert_pct: 15      # possible leak / theft — 0 = off
+  drop_window_minutes: 60
+  drop_only_when_stopped: true
+```
+
+Unlike the register `warn_range` / `alarm_range` bands, these are evaluated whether
+or not the engine is running — a tank running dry matters most while the generator
+is *stopped* and there is still time to do something. Messages quote gallons
+alongside the percentage (from `site.tank_gal`), which is what you repeat to the
+fuel supplier. Gaseous-fuel sites are inert automatically: no local tank to empty.
+
+The drop alert is the leak/siphon signal, so by default it only looks while the
+engine isn't burning — and a run resets its baseline, so a normal exercise cycle
+can't read as theft once the engine stops.
+
+Which of those reach Slack, and where:
+
+```yaml
+slack:
+  alert_on_fuel_warning: true
+  alert_on_fuel_critical: true
+  alert_on_fuel_reminder: true
+  alert_on_fuel_recovered: true
+  alert_on_fuel_drop: true
+  channel_fuel: ""                  # blank = main channel
+  mention_on_fuel_critical: "<!channel>"   # critical + drop only
+```
+
 **Sign-in alerts** are worth turning on whenever the console is reachable from the
 internet — that's how you learn about a password-spraying attempt from Slack rather
 than from the audit table afterwards:
@@ -403,7 +444,7 @@ than from the audit table afterwards:
 ```
 
 **Settings → Alerts → Test messages** posts through the real route for each alert
-type — channel override and mention included — so you can prove the plumbing before
+type (general, transfer, fuel, security) — channel override and mention included — so you can prove the plumbing before
 an outage tests it for you.
 
 ---
@@ -1040,6 +1081,7 @@ cd backend
 - `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping (incl. withheld when the engine-state block fails), batch-fallback behavior, fan-out-failure preserves last-good value, per-tier TTL evicts stale values, short reads count as failures, a partial fan-out doesn't flip comms to LOST, Modbus client lock released between retry attempts, JWT-secret + admin-hash refuse-to-boot in production (empty / `REPLACE_ME` placeholder / too-short / non-bcrypt), control rejected when H-100 comms LOST, env-vars override `config.yaml` (with nested deep-merge), SQLite 1m→1h rollup + long-span read + chunked prune + WAL checkpoint, `panel` CLI command output (text + JSON), `genwatch hash` stdin-prompt behavior.
 - `test_ats_control.py` — ATS-Pi command write side (Phase 3): each command writes the expected ICD register/value, confirm-token flow (valid / invalid / single-use), role gating (force-transfer admin-only), force-transfer healthy-utility override guard, comms-loss / non-authoritative link returns 502 / 409.
 - `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, dedupe window suppresses flap, retry deadline abandons stale messages, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
+- `test_fuel.py` — fuel thresholds and hysteresis (a sloshing sender warns once, not per poll), the still-low reminder, refuel recovery, sensor-fault suppression (None / 0xFFFF / out-of-range readings stay silent), the drop detector including the regression that a normal exercise run must not read as theft, Slack routing/gating, the state-machine integration, and the config hot-reload keeping its state.
 - `test_slack_alerts.py` — the configurable transfer alerts: per-direction gating, channel routing and its fallback, mention placement (inside the message body, where Slack actually reads it), the settle-time debounce collapsing a flap to silence and reporting the settled state after hunting, security-alert gating and per-account dedupe, and the per-route test message.
 - `test_users_auth.py` — password policy, username rules, the last-admin guard rails, the login decision (enumeration resistance, escalating lockout, lockout disclosed only to a correct password), TOTP against the RFC 6238 vectors plus replay refusal and single-use recovery codes, the legacy-hash bootstrap, the HTTP surface (logout revoking a replayed cookie, password change revoking other sessions, role gates, must-change-password gate, idle timeout), the response-hardening middleware, the account CLI, and the public-exposure boot refusals.
 - `test_ats_service.py` — ATS-Pi snapshot decode, authoritative-gate, ICD §5.4 minor-version semantics, reboot detection.

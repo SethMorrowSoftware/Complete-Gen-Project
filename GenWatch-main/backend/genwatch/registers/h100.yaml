@@ -236,13 +236,22 @@ registers:
   - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F }
   - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
   - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  # coolant_level: genmon's HPanelReg reads COOLANT_LEVEL (0x0090) as a RAW
-  # integer (no divider), so the previous scale: 0.1 made GenWatch read 10× too
-  # low — a healthy 95 showed as 9.5 and tripped the UI's low-coolant indicator.
-  # Decode raw. NOTE: confirm the panel's engineering unit during commissioning
-  # (`genwatch panel`) — the H-100 may report this in a controller-specific unit
-  # rather than a true percent.
-  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  # coolant_level: reported in TENTHS of a percent on this panel — scale 0.1.
+  #
+  # Field-verified during commissioning: the register read 772 while the H-100
+  # LCD showed 77.2%. That settles a question this map had been guessing at. An
+  # earlier revision carried `scale: 0.1`, then dropped it on the theory (from
+  # genmon's HPanelReg, which reads COOLANT_LEVEL as a raw integer) that a
+  # reading of 95 meant a healthy 95% rather than 9.5%. The panel disagrees:
+  # raw 95 on this controller is 9.5%, which is a genuinely low tank rather
+  # than a scaling artifact.
+  #
+  # Symptom when this is wrong: the dashboard reads "772.0 %", the coolant bar
+  # overruns its track, and the low-coolant indicator (<50%) can never trip.
+  # If YOUR panel disagrees with GenWatch here, cross-check with
+  # `genwatch panel` — this is the kind of thing that varies by controller
+  # firmware revision.
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct, scale: 0.1 }
   - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
   - { name: throttle_position, addr: 0x0096, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
   - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }

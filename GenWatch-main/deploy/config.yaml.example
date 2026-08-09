@@ -273,6 +273,20 @@ slack:
   # 0 = send immediately.
   load_source_debounce_s: 0
 
+  # ── Fuel alerts ────────────────────────────────────────────────────
+  # Gated by the `fuel` section below (off by default). These flags only
+  # pick which fuel events reach Slack once monitoring is on.
+  alert_on_fuel_warning: true     # crossed the low threshold
+  alert_on_fuel_critical: true    # crossed the critical threshold
+  alert_on_fuel_reminder: true    # still low N hours later
+  alert_on_fuel_recovered: true   # refuelled
+  alert_on_fuel_drop: true        # abnormal drop (possible leak / theft)
+  channel_fuel: ""                # blank = use `channel`
+  # Applied to the critical tier and the drop alert only — a "order fuel
+  # this week" warning that pings @channel at 2 a.m. teaches people to
+  # mute the channel. Same syntax as the transfer mentions above.
+  mention_on_fuel_critical: ""
+
   # ── Sign-in & account alerts ───────────────────────────────────────
   # Worth turning on whenever this console is internet-facing — it's how
   # you learn about a password-spraying attempt from Slack rather than
@@ -285,6 +299,50 @@ slack:
   # These messages name accounts and source addresses; an admin-only
   # channel is usually the right home. Blank = use `channel`.
   channel_security: ""
+
+# ─── Fuel level monitoring ────────────────────────────────────────────────
+# Low-tank warnings and abnormal-drop (leak / theft) detection. Alerts are
+# sent through Slack using the alert_on_fuel_* flags above; the thresholds
+# here describe the CONDITION rather than the notification.
+#
+# Evaluated whether or not the engine is running — unlike the register
+# warn_range/alarm_range bands, which only apply while it is producing. A
+# tank running dry matters most while the generator is stopped and there
+# is still time to do something about it.
+#
+# DISABLED BY DEFAULT on purpose: fuel_level_pct (0x0092) is not verified
+# on every H-100 revision, and an unconfigured channel on this controller
+# reads 0xFFFF. Confirm the reading against the panel first:
+#
+#     sudo -u genwatch genwatch panel | grep fuel
+#
+# Automatically inert at gaseous-fuel sites (site.fuel_type in the
+# register map) — no local tank to run out of. Tank size for the "≈N gal"
+# figure in the alerts also comes from the register map (site.tank_gal).
+fuel:
+  enabled: false
+  warn_pct: 25            # "order fuel this week"
+  critical_pct: 10        # "you have hours of runtime left"
+  # A tank on a running genset sloshes. The level must rise this far above
+  # a threshold before we call the situation improved, so a sender
+  # hovering on the line warns once instead of flapping.
+  hysteresis_pct: 3
+  # Repeat while the tank is still low — silence after the first message
+  # reads as "handled". 0 = say it once.
+  renotify_hours: 12
+  # Readings outside this band are treated as a SENSOR FAULT and suppress
+  # alerting, rather than being read as an empty tank.
+  min_valid_pct: 0
+  max_valid_pct: 100
+  # Abnormal-drop detection: alert when the level falls this many points
+  # within drop_window_minutes. 0 = off. The right threshold depends on
+  # tank size and site behaviour, so there is no useful default.
+  drop_alert_pct: 0
+  drop_window_minutes: 60
+  # Only evaluate while the engine is NOT burning fuel. A loaded generator
+  # drawing the tank down is expected and would alert on every outage; the
+  # same fall with the engine stopped is a leak or a siphon.
+  drop_only_when_stopped: true
 
 # ─── MQTT status publishing ───────────────────────────────────────────────
 # When enabled, GenWatch publishes the generator's load status to an MQTT
