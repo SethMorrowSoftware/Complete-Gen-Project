@@ -75,6 +75,66 @@ interface Config {
   mqtt: MqttConfigView;
 }
 
+// GET /api/config gained sections over time (`security` and `auth` detail
+// with the accounts work, `fuel` with the fuel alerts). The browser can be
+// running a NEWER interface than the service behind it: install.sh drops
+// the new static assets in place, but the old Python process keeps serving
+// them until `systemctl restart genwatch`. In that window the response is
+// missing whole sections, and reading through one — `fuel.fuelType` — threw
+// during render, which unmounted the console to a black screen.
+//
+// Fill in defaults so an older backend degrades to "shows defaults, saves
+// what it understands" instead of crashing. The values here mirror the
+// backend's own defaults (config.py) so what's displayed matches what an
+// un-upgraded service is actually doing.
+const FUEL_DEFAULTS: FuelConfigView = {
+  enabled: false,
+  warn_pct: 25,
+  critical_pct: 10,
+  hysteresis_pct: 3,
+  renotify_hours: 12,
+  min_valid_pct: 0,
+  max_valid_pct: 100,
+  drop_alert_pct: 0,
+  drop_window_minutes: 60,
+  drop_only_when_stopped: true,
+  tankGal: 0,
+  fuelType: "unknown",
+};
+
+const SECURITY_DEFAULTS: Config["security"] = {
+  publicExposure: false,
+  requireHttps: false,
+  headersEnabled: true,
+  hstsEnabled: true,
+  ipAllowlistCount: 0,
+};
+
+const AUTH_DEFAULTS: Config["auth"] = {
+  operatorName: "operator",
+  sessionHours: 12,
+  idleTimeoutMinutes: 0,
+  passwordConfigured: false,
+  jwtSecretConfigured: false,
+  requireTotp: false,
+  passwordMinLength: 12,
+  lockoutThreshold: 5,
+  lockoutSeconds: 900,
+  accountCount: 0,
+};
+
+/** Fill in any section the service didn't send. */
+function normalizeConfig(raw: Config): Config {
+  return {
+    ...raw,
+    auth: { ...AUTH_DEFAULTS, ...(raw.auth ?? {}) },
+    security: { ...SECURITY_DEFAULTS, ...(raw.security ?? {}) },
+    fuel: { ...FUEL_DEFAULTS, ...(raw.fuel ?? {}) },
+    slack: (raw.slack ?? {}) as SlackConfigView,
+    mqtt: (raw.mqtt ?? {}) as MqttConfigView,
+  };
+}
+
 export function SettingsView({ auth, onAuthChanged }: {
   auth: MeBody;
   onAuthChanged: () => void;
@@ -87,7 +147,9 @@ export function SettingsView({ auth, onAuthChanged }: {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.config().then(setCfg).catch((e) => setError(e?.message ?? "failed to load config"));
+    api.config()
+      .then((c) => setCfg(normalizeConfig(c)))
+      .catch((e) => setError(e?.message ?? "failed to load config"));
   }, []);
 
   if (!cfg) return <SettingsLoadingSkeleton />;
@@ -122,7 +184,7 @@ export function SettingsView({ auth, onAuthChanged }: {
       setSaved(message);
       setDirty({});
       const fresh = await api.config();
-      setCfg(fresh);
+      setCfg(normalizeConfig(fresh));
     } catch (e: any) {
       setError(e?.body?.detail ?? e?.message ?? "save failed");
     } finally {
