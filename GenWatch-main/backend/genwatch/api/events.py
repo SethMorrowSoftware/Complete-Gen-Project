@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..services.control import ControlError
-from .deps import Principal, require_operator
+from .deps import Principal, require_operator, require_viewer
 
 log = logging.getLogger("genwatch.api.events")
 
@@ -22,7 +22,7 @@ async def events(
     type: str | None = Query(None),
     from_ts: float | None = Query(None, alias="from"),
     to_ts: float | None = Query(None, alias="to"),
-    p: Principal = Depends(require_operator),
+    p: Principal = Depends(require_viewer),
 ) -> dict:
     db = request.app.state.db
     sevs = severity.split(",") if severity else None
@@ -40,7 +40,7 @@ async def events(
 async def alarms(
     request: Request,
     active: bool = Query(True),
-    p: Principal = Depends(require_operator),
+    p: Principal = Depends(require_viewer),
 ) -> dict:
     db = request.app.state.db
     if not active:
@@ -53,7 +53,7 @@ async def alarms(
 @router.get("/alarm-codes")
 async def alarm_codes(
     request: Request,
-    p: Principal = Depends(require_operator),
+    p: Principal = Depends(require_viewer),
 ) -> dict:
     regmap = request.app.state.regmap
     return {

@@ -74,7 +74,7 @@ def test_rate_limiter_retry_after_reports_seconds():
 async def test_login_returns_429_after_repeated_failures(client):
     last_status = None
     for _ in range(8):
-        r = await client.post("/api/auth/login", json={"password": "WRONG"})
+        r = await client.post("/api/auth/login", json={"username": "admin", "password": "WRONG"})
         last_status = r.status_code
         if last_status == 429:
             break
@@ -1445,7 +1445,7 @@ def _parse_set_cookie(header: str) -> dict[str, str]:
 
 async def test_login_cookie_defaults_are_strict_samesite_and_httponly(client):
     """Default: SameSite=strict, HttpOnly, no Secure on plain HTTP."""
-    r = await client.post("/api/auth/login", json={"password": "test"})
+    r = await client.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200
     sc = r.headers.get("set-cookie", "")
     attrs = _parse_set_cookie(sc)
@@ -1464,7 +1464,7 @@ async def test_login_cookie_auto_secure_on_https_request(app_env):
     async with httpx.AsyncClient(transport=transport, base_url="https://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
-            r = await c.post("/api/auth/login", json={"password": "test"})
+            r = await c.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200
     sc = r.headers.get("set-cookie", "")
     attrs = _parse_set_cookie(sc)
@@ -1485,7 +1485,7 @@ async def test_cookie_secure_explicit_true_forces_secure_even_on_http(monkeypatc
     async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
-            r = await c.post("/api/auth/login", json={"password": "test"})
+            r = await c.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200
     attrs = _parse_set_cookie(r.headers.get("set-cookie", ""))
     assert "secure" in attrs, "explicit cookie_secure=true must force Secure"
@@ -1505,7 +1505,7 @@ async def test_cookie_samesite_lax_override_applies(monkeypatch, tmp_path):
     async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
-            r = await c.post("/api/auth/login", json={"password": "test"})
+            r = await c.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200
     attrs = _parse_set_cookie(r.headers.get("set-cookie", ""))
     assert attrs.get("samesite", "").lower() == "lax"
@@ -1528,16 +1528,23 @@ def test_cookie_samesite_none_without_secure_rejected_at_config_load():
 async def test_logout_clears_cookie_with_matching_attributes(client):
     """delete_cookie() must mirror set_cookie()'s SameSite / Secure /
     Path so the browser actually evicts the cookie. Missing attributes
-    cause some browsers to leave a stale (but expired) cookie behind."""
+    cause some browsers to leave a stale (but expired) cookie behind.
+
+    Logout clears BOTH cookie names — an operator who turned TLS on
+    mid-session holds the plain-named cookie while the server would now
+    issue the ``__Host-`` one, and clearing only the current name would
+    leave the other in the jar."""
     # Establish a session
-    r = await client.post("/api/auth/login", json={"password": "test"})
+    r = await client.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200
-    # Logout and inspect the clearing Set-Cookie
+    # Logout and inspect the clearing Set-Cookie headers
     r = await client.post("/api/auth/logout")
     assert r.status_code == 200
-    sc = r.headers.get("set-cookie", "")
-    attrs = _parse_set_cookie(sc)
-    assert attrs["name"] == "genwatch_session"
+    headers = r.headers.get_list("set-cookie")
+    by_name = {a["name"]: a for a in (_parse_set_cookie(h) for h in headers)}
+    assert set(by_name) == {"genwatch_session", "__Host-genwatch_session"}, by_name
+
+    attrs = by_name["genwatch_session"]
     assert attrs.get("samesite", "").lower() == "strict"
     assert attrs.get("path") == "/"
     # Either Max-Age=0 or an Expires in the past — both are valid clears
@@ -1545,7 +1552,12 @@ async def test_logout_clears_cookie_with_matching_attributes(client):
         attrs.get("max-age") == "0"
         or "expires" in attrs
     )
-    assert cleared, f"logout did not clear the cookie: {sc!r}"
+    assert cleared, f"logout did not clear the cookie: {headers!r}"
+    # The __Host- prefix is only honored by browsers when the cookie is
+    # Secure + Path=/ — a clear that omits them is ignored.
+    host_attrs = by_name["__Host-genwatch_session"]
+    assert "secure" in host_attrs
+    assert host_attrs.get("path") == "/"
 
 
 async def test_tcp_client_reports_failure_when_bridge_unreachable():

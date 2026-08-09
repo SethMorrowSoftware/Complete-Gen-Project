@@ -113,6 +113,68 @@ CREATE TABLE IF NOT EXISTS kv (
     v           TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+
+-- ─── Accounts ────────────────────────────────────────────────────────────
+-- Named operator accounts. Replaces the original single shared password
+-- (auth.admin_password_hash), which is now only used to seed the first
+-- admin on an upgrade (see services/users.ensure_bootstrap_user).
+--
+-- COLLATE NOCASE on username: 'Alice' and 'alice' are the same account, so
+-- an attacker can't register a look-alike and an operator can't lock
+-- themselves out with a capital letter.
+CREATE TABLE IF NOT EXISTS users (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    username             TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash        TEXT    NOT NULL,
+    role                 TEXT    NOT NULL DEFAULT 'operator',  -- viewer|operator|admin
+    disabled             INTEGER NOT NULL DEFAULT 0,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    totp_secret          TEXT    NOT NULL DEFAULT '',   -- base32; '' = not enrolled
+    totp_enabled         INTEGER NOT NULL DEFAULT 0,
+    totp_last_counter    INTEGER NOT NULL DEFAULT 0,    -- replay guard (see totp.py)
+    -- Bumped on password change / admin revoke. Every session token carries
+    -- the epoch it was minted under; a mismatch invalidates it instantly,
+    -- so a stolen cookie dies the moment the password is rotated.
+    token_epoch          INTEGER NOT NULL DEFAULT 1,
+    failed_attempts      INTEGER NOT NULL DEFAULT 0,
+    locked_until         REAL    NOT NULL DEFAULT 0,
+    last_login_at        REAL,
+    last_login_ip        TEXT    NOT NULL DEFAULT '',
+    password_changed_at  REAL    NOT NULL DEFAULT 0,
+    created_at           REAL    NOT NULL DEFAULT 0,
+    created_by           TEXT    NOT NULL DEFAULT ''
+);
+
+-- Single-use TOTP recovery codes. Stored as SHA-256 of a 128-bit random
+-- code: unlike a password these are full-entropy secrets, so a slow KDF
+-- buys nothing (there is no dictionary to run) while costing ~0.3 s per
+-- code at enrollment time.
+CREATE TABLE IF NOT EXISTS user_recovery_codes (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT    NOT NULL,
+    created_at REAL   NOT NULL,
+    used_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_user ON user_recovery_codes(user_id);
+
+-- Server-side session records, keyed by the JWT's `jti`. Gives us three
+-- things a stateless JWT can't: real logout (revoke on the server, not
+-- just "drop the cookie and hope"), an idle timeout, and an operator-
+-- visible list of live sessions that an admin can kill.
+CREATE TABLE IF NOT EXISTS sessions (
+    jti          TEXT    PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    username     TEXT    NOT NULL,
+    created_at   REAL    NOT NULL,
+    last_seen_at REAL    NOT NULL,
+    expires_at   REAL    NOT NULL,
+    revoked_at   REAL,
+    ip           TEXT    NOT NULL DEFAULT '',
+    user_agent   TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 """
 
 # Map register name -> telemetry column name. Names not present here
@@ -525,6 +587,218 @@ class Database:
             return self.path.stat().st_size + (self.path.parent / (self.path.name + "-wal")).stat().st_size
         except FileNotFoundError:
             return 0
+
+    # ─── users ─────────────────────────────────────────────────────────
+    # Thin CRUD only. Policy (password strength, lockout maths, role
+    # guard rails) lives in services/users.py so it can be unit-tested
+    # without a database and so this layer stays a dumb store.
+
+    def user_create(
+        self,
+        *,
+        username: str,
+        password_hash: str,
+        role: str = "operator",
+        must_change_password: bool = False,
+        disabled: bool = False,
+        created_by: str = "",
+    ) -> int:
+        now = time.time()
+        with self._writer() as c:
+            cur = c.execute(
+                "INSERT INTO users (username, password_hash, role, disabled, "
+                "must_change_password, password_changed_at, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    username, password_hash, role, int(disabled),
+                    int(must_change_password), now, now, created_by,
+                ),
+            )
+            return cur.lastrowid or 0
+
+    def user_get(self, username: str) -> dict | None:
+        with self._reader() as c:
+            r = c.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
+        return dict(r) if r else None
+
+    def user_get_by_id(self, user_id: int) -> dict | None:
+        with self._reader() as c:
+            r = c.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(r) if r else None
+
+    def user_list(self) -> list[dict]:
+        with self._reader() as c:
+            rows = c.execute("SELECT * FROM users ORDER BY username COLLATE NOCASE").fetchall()
+        return [dict(r) for r in rows]
+
+    def user_count(self) -> int:
+        with self._reader() as c:
+            row = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"] if row else 0)
+
+    def count_enabled_admins(self, *, excluding_id: int | None = None) -> int:
+        """Enabled admins, optionally ignoring one account.
+
+        Used by the guard rails that stop an admin from deleting,
+        disabling, or demoting the last way into the system — a lockout
+        on an internet-exposed generator console means a site visit.
+        """
+        sql = "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0"
+        args: list = []
+        if excluding_id is not None:
+            sql += " AND id != ?"
+            args.append(excluding_id)
+        with self._reader() as c:
+            row = c.execute(sql, args).fetchone()
+        return int(row["n"] if row else 0)
+
+    def user_set_password(self, user_id: int, password_hash: str, *, must_change: bool = False) -> None:
+        """Set a new hash, clear the must-change flag unless asked to keep
+        it, and bump token_epoch so every existing session for this user
+        stops validating on its next request."""
+        with self._writer() as c:
+            c.execute(
+                "UPDATE users SET password_hash = ?, password_changed_at = ?, "
+                "must_change_password = ?, token_epoch = token_epoch + 1, "
+                "failed_attempts = 0, locked_until = 0 WHERE id = ?",
+                (password_hash, time.time(), int(must_change), user_id),
+            )
+
+    def user_update(self, user_id: int, **fields) -> None:
+        """Update a whitelisted set of scalar columns."""
+        allowed = {
+            "role", "disabled", "must_change_password", "totp_secret",
+            "totp_enabled", "totp_last_counter", "failed_attempts",
+            "locked_until", "last_login_at", "last_login_ip",
+        }
+        cols = [k for k in fields if k in allowed]
+        if not cols:
+            return
+        sets = ", ".join(f"{c} = ?" for c in cols)
+        args = [fields[c] for c in cols]
+        args.append(user_id)
+        with self._writer() as c:
+            c.execute(f"UPDATE users SET {sets} WHERE id = ?", args)
+
+    def user_bump_token_epoch(self, user_id: int) -> None:
+        with self._writer() as c:
+            c.execute("UPDATE users SET token_epoch = token_epoch + 1 WHERE id = ?", (user_id,))
+
+    def user_delete(self, user_id: int) -> bool:
+        with self._writer() as c:
+            cur = c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return (cur.rowcount or 0) > 0
+
+    def user_record_login_ok(self, user_id: int, ip: str) -> None:
+        with self._writer() as c:
+            c.execute(
+                "UPDATE users SET failed_attempts = 0, locked_until = 0, "
+                "last_login_at = ?, last_login_ip = ? WHERE id = ?",
+                (time.time(), ip, user_id),
+            )
+
+    def user_record_login_fail(self, user_id: int, *, locked_until: float = 0.0) -> int:
+        """Increment the failure counter (and optionally arm a lockout).
+        Returns the new failure count."""
+        with self._writer() as c:
+            c.execute(
+                "UPDATE users SET failed_attempts = failed_attempts + 1, "
+                "locked_until = MAX(locked_until, ?) WHERE id = ?",
+                (locked_until, user_id),
+            )
+            row = c.execute("SELECT failed_attempts FROM users WHERE id = ?", (user_id,)).fetchone()
+        return int(row["failed_attempts"] if row else 0)
+
+    # ─── recovery codes ────────────────────────────────────────────────
+    def recovery_codes_replace(self, user_id: int, code_hashes: list[str]) -> None:
+        now = time.time()
+        with self._writer() as c:
+            c.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (user_id,))
+            c.executemany(
+                "INSERT INTO user_recovery_codes (user_id, code_hash, created_at) VALUES (?, ?, ?)",
+                [(user_id, h, now) for h in code_hashes],
+            )
+
+    def recovery_code_consume(self, user_id: int, code_hash: str) -> bool:
+        """Burn a matching unused code. Returns True if one was consumed."""
+        with self._writer() as c:
+            cur = c.execute(
+                "UPDATE user_recovery_codes SET used_at = ? "
+                "WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+                (time.time(), user_id, code_hash),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def recovery_codes_remaining(self, user_id: int) -> int:
+        with self._reader() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM user_recovery_codes "
+                "WHERE user_id = ? AND used_at IS NULL",
+                (user_id,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    # ─── sessions ──────────────────────────────────────────────────────
+    def session_create(
+        self, *, jti: str, user_id: int, username: str,
+        expires_at: float, ip: str = "", user_agent: str = "",
+    ) -> None:
+        now = time.time()
+        with self._writer() as c:
+            c.execute(
+                "INSERT INTO sessions (jti, user_id, username, created_at, "
+                "last_seen_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (jti, user_id, username, now, now, expires_at, ip, user_agent[:200]),
+            )
+
+    def session_get(self, jti: str) -> dict | None:
+        with self._reader() as c:
+            r = c.execute("SELECT * FROM sessions WHERE jti = ?", (jti,)).fetchone()
+        return dict(r) if r else None
+
+    def session_touch(self, jti: str) -> None:
+        with self._writer() as c:
+            c.execute("UPDATE sessions SET last_seen_at = ? WHERE jti = ?", (time.time(), jti))
+
+    def session_revoke(self, jti: str) -> bool:
+        with self._writer() as c:
+            cur = c.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL",
+                (time.time(), jti),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def session_revoke_all_for_user(self, user_id: int, *, except_jti: str | None = None) -> int:
+        sql = "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL"
+        args: list = [time.time(), user_id]
+        if except_jti:
+            sql += " AND jti != ?"
+            args.append(except_jti)
+        with self._writer() as c:
+            cur = c.execute(sql, args)
+            return cur.rowcount or 0
+
+    def sessions_for_user(self, user_id: int, *, active_only: bool = True) -> list[dict]:
+        sql = "SELECT * FROM sessions WHERE user_id = ?"
+        args: list = [user_id]
+        if active_only:
+            sql += " AND revoked_at IS NULL AND expires_at > ?"
+            args.append(time.time())
+        sql += " ORDER BY created_at DESC"
+        with self._reader() as c:
+            rows = c.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def sessions_prune(self, *, older_than_s: float = 7 * 86400) -> int:
+        """Drop session rows that expired more than `older_than_s` ago.
+        Keeps recently-expired rows around so the sessions list still
+        shows 'signed out this morning' for a short forensic window."""
+        cutoff = time.time() - older_than_s
+        with self._writer() as c:
+            cur = c.execute("DELETE FROM sessions WHERE expires_at < ?", (cutoff,))
+            return cur.rowcount or 0
 
     # ─── kv ────────────────────────────────────────────────────────────
     def kv_get(self, key: str) -> str | None:

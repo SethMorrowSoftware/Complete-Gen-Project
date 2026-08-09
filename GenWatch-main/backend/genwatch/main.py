@@ -22,7 +22,7 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, config as cfgmod
@@ -33,6 +33,7 @@ from .api import events as events_routes
 from .api import settings as settings_routes
 from .api import status as status_routes
 from .api import telemetry as telemetry_routes
+from .api import users as users_routes
 from .api import ws as ws_routes
 from .db import Database
 from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient, TcpRtuModbusClient
@@ -47,6 +48,7 @@ from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
 from .services.slack import SlackNotifier
 from .services.state import EventBus, StateMachine
+from .services.users import UserService, ensure_bootstrap_user
 
 log = logging.getLogger("genwatch")
 
@@ -106,23 +108,6 @@ async def lifespan(app: FastAPI):
         )
         log.warning("auth.jwt_secret was unset/placeholder — generated an ephemeral one for mock mode (tokens won't survive restart).")
 
-    # admin_password_hash must be a real bcrypt hash in production. With
-    # the "REPLACE_ME" placeholder (or any non-bcrypt string) the service
-    # would boot "healthy" — green systemd unit, green watchdog — but
-    # every /api/auth/login returns 401 because bcrypt.checkpw rejects a
-    # non-$2 hash. Fail loudly so an unusable deployment surfaces as an
-    # actionable boot error rather than a mysterious lockout. (The
-    # installer only starts the service once a real hash is set; this is
-    # the runtime backstop for manual starts / restored configs.)
-    pw_hash = settings.auth.admin_password_hash
-    if not settings.mock and ((not pw_hash) or pw_hash == PLACEHOLDER or not pw_hash.startswith("$2")):
-        raise RuntimeError(
-            "auth.admin_password_hash is unset or still the 'REPLACE_ME' "
-            "placeholder. Generate it with `sudo genwatch hash` and paste the "
-            "$2b$... value into /etc/genwatch/config.yaml, then restart. "
-            "Refusing to start: login would fail for every operator."
-        )
-
     # Locate register file
     reg_path = Path(settings.modbus.register_file)
     if not reg_path.is_absolute():
@@ -134,6 +119,36 @@ async def lifespan(app: FastAPI):
 
     db = Database(settings.db_path)
     log.info("Database at %s (%d bytes)", db.path, db.disk_usage_bytes())
+
+    # ── Operator accounts ─────────────────────────────────────────────
+    # Logins are per-user (see services/users.py). An existing deployment
+    # upgrading from the single shared password gets its hash migrated
+    # into a real admin account here so nobody is locked out by the
+    # upgrade itself; after that, admin_password_hash is unused.
+    bootstrap = ensure_bootstrap_user(db, settings.auth)
+    for warning in bootstrap.warnings:
+        log.warning("%s", warning)
+    user_service = UserService(db, settings.auth)
+
+    # Production must have a usable way in. Either real accounts exist, or
+    # there's a valid legacy hash we can seed one from. Without either the
+    # unit would come up "healthy" — green systemd, green watchdog — while
+    # every login returns 401: a silent lockout that looks like a hang.
+    pw_hash = settings.auth.admin_password_hash
+    if not settings.mock and db.count_enabled_admins() == 0:
+        placeholder_hash = (not pw_hash) or pw_hash == PLACEHOLDER or not pw_hash.startswith("$2")
+        raise RuntimeError(
+            "No enabled admin account exists and auth.admin_password_hash is "
+            + ("unset or still the 'REPLACE_ME' placeholder. " if placeholder_hash else
+               "not a usable bcrypt hash. ")
+            + "Create an account with `sudo -u genwatch genwatch useradd <username> "
+            "--role admin`, or generate a hash with `sudo genwatch hash` and paste "
+            "the $2b$... value into auth.admin_password_hash in "
+            "/etc/genwatch/config.yaml, then restart. Refusing to start: nobody "
+            "could sign in."
+        )
+
+    _check_public_exposure(settings, db)
 
     # Choose client implementation
     if settings.mock:
@@ -394,8 +409,17 @@ async def lifespan(app: FastAPI):
     poller = Poller(client, regmap, on_poll)
     retention = RetentionService(db, settings.retention)
 
-    # 5 login attempts then 1 token every 3 minutes (~20/hour steady state).
-    login_limiter = RateLimiter(capacity=5, refill_per_s=1.0 / 180.0)
+    # Per-IP login bucket: `login_rate_burst` attempts, then one more every
+    # `login_rate_refill_seconds` (default 5 then 1 per 3 min ≈ 20/hour).
+    burst = max(1, int(settings.auth.login_rate_burst))
+    refill_s = max(1.0, float(settings.auth.login_rate_refill_seconds))
+    login_limiter = RateLimiter(capacity=burst, refill_per_s=1.0 / refill_s)
+    # Per-ACCOUNT bucket, keyed on the submitted username. The per-IP
+    # bucket alone is porous against a botnet or anything behind CGNAT;
+    # this one follows the target instead of the source. Slightly more
+    # generous than the IP bucket so a fat-fingered operator on a shared
+    # address isn't the first thing to trip.
+    login_user_limiter = RateLimiter(capacity=burst * 2, refill_per_s=1.0 / refill_s)
     # ATS command actuation: burst of 3, then 1 every 5 s, per operator.
     # Ample for human operation; stops a buggy/hostile client looping
     # token->command pairs and flapping a maintained relay.
@@ -413,7 +437,9 @@ async def lifespan(app: FastAPI):
     app.state.retention = retention
     app.state.slack = slack
     app.state.mqtt = mqtt
+    app.state.users = user_service
     app.state.login_limiter = login_limiter
+    app.state.login_user_limiter = login_user_limiter
     app.state.command_limiter = command_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
@@ -553,6 +579,135 @@ async def lifespan(app: FastAPI):
         await client.close()
         db.write_event("info", "BOOT", "Castle Generator Monitor stopped", None)
         db.close()
+
+
+def _ip_allowed(client_ip: str, allowlist: list[str]) -> bool:
+    """Is ``client_ip`` covered by the allowlist (IPs or CIDRs)?
+
+    Loopback is always allowed: an operator with shell access on the Pi
+    must be able to reach the console to repair a bad allowlist, and a
+    typo'd CIDR should never require a site visit. Entries that don't
+    parse are ignored with a warning rather than failing the whole list
+    closed — one bad line shouldn't lock everyone out.
+    """
+    import ipaddress
+
+    if not client_ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    for entry in allowlist:
+        entry = (entry or "").strip()
+        if not entry:
+            continue
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            log.warning("security.ip_allowlist: ignoring unparseable entry %r", entry)
+    return False
+
+
+def _check_public_exposure(settings, db: Database) -> None:
+    """Refuse (or loudly warn about) a configuration that is fine on a LAN
+    and reckless on a public address.
+
+    Flipping ``security.public_exposure: true`` is the operator saying
+    "this console is reachable from the internet". That claim changes what
+    counts as a misconfiguration: a 12-hour session with no idle timeout,
+    or a service that still trusts a shared password, is a reasonable
+    trade behind Tailscale and a bad one on a public IP. Errors here are
+    the settings that would be actively dangerous; the rest are warnings,
+    because refusing to boot a generator monitor is its own hazard.
+    """
+    sec = settings.security
+    if not sec.public_exposure:
+        # Still worth one nudge: an operator who never sets the flag gets
+        # no checklist at all, and this is the class of thing people
+        # discover after the fact.
+        if settings.cors_origins and any(o.strip() == "*" for o in settings.cors_origins):
+            log.warning(
+                "cors_origins contains '*' with allow_credentials — any website a "
+                "logged-in operator visits can read this API. Remove it."
+            )
+        return
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if settings.mock:
+        errors.append(
+            "mock mode is on — an internet-facing deployment would be publishing "
+            "synthesized telemetry as if it were the real generator"
+        )
+    if settings.auth.cookie_secure is False:
+        errors.append(
+            "auth.cookie_secure is explicitly false — the session cookie would be "
+            "sent over plain HTTP where anyone on the path can copy it"
+        )
+    if any(o.strip() == "*" for o in (settings.cors_origins or [])):
+        errors.append(
+            "cors_origins contains '*' with credentialed CORS — that hands the API "
+            "to any website an authenticated operator happens to visit"
+        )
+    if settings.auth.lockout_seconds <= 0:
+        errors.append(
+            "auth.lockout_seconds is 0 — account lockout is disabled, leaving only "
+            "the per-IP rate limiter between the internet and unlimited password guessing"
+        )
+    if db.count_enabled_admins() == 0:
+        errors.append("no enabled admin account exists")
+
+    if not settings.https_required:
+        warnings.append(
+            "security.require_https is off — set it (or leave it unset with "
+            "public_exposure on) so plain-HTTP requests are refused"
+        )
+    if not settings.auth.require_totp:
+        warnings.append(
+            "auth.require_totp is off — a password alone is the only thing "
+            "protecting generator control from the open internet. Enroll accounts "
+            "(Settings → Account) and then turn it on"
+        )
+    if settings.auth.session_hours > 12:
+        warnings.append(
+            f"auth.session_hours is {settings.auth.session_hours} — consider a "
+            "shorter session for an internet-facing console"
+        )
+    if settings.auth.idle_timeout_minutes <= 0:
+        warnings.append(
+            "auth.idle_timeout_minutes is 0 — an abandoned browser tab keeps a "
+            "usable session until absolute expiry"
+        )
+    if not sec.headers_enabled:
+        warnings.append("security.headers_enabled is off — no CSP / clickjacking defence")
+    if settings.auth.admin_password_hash and db.user_count() > 0:
+        warnings.append(
+            "auth.admin_password_hash is still set but unused now that accounts "
+            "exist — clear it so a stale shared password isn't sitting in config.yaml"
+        )
+
+    for w in warnings:
+        log.warning("public exposure: %s", w)
+    if errors:
+        raise RuntimeError(
+            "security.public_exposure is true but the configuration is unsafe for "
+            "an internet-facing deployment:\n  - " + "\n  - ".join(errors)
+            + "\nFix these in /etc/genwatch/config.yaml and restart, or set "
+            "security.public_exposure: false if this console is not actually "
+            "reachable from the internet."
+        )
+    log.info(
+        "public exposure mode: https_required=%s require_totp=%s lockout=%ss "
+        "idle_timeout=%smin allowlist=%d entr%s",
+        settings.https_required, settings.auth.require_totp,
+        settings.auth.lockout_seconds, settings.auth.idle_timeout_minutes,
+        len(sec.ip_allowlist), "y" if len(sec.ip_allowlist) == 1 else "ies",
+    )
 
 
 async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
@@ -747,12 +902,82 @@ def create_app() -> FastAPI:
             )
         return await call_next(request)
 
+    # Transport + response hardening. Registered AFTER the CSRF middleware
+    # so it sits outermost: the allowlist and the HTTPS check run before
+    # any handler work, and the headers are applied to every response
+    # including the ones those checks generate.
+    @app.middleware("http")
+    async def security_layer(request: Request, call_next):
+        settings = getattr(request.app.state, "settings", None)
+        sec = getattr(settings, "security", None) if settings else None
+
+        # 1. Network allowlist. Loopback always passes so a local admin
+        #    can fix a bad allowlist without a serial console.
+        if sec is not None and sec.ip_allowlist:
+            client_ip = request.client.host if request.client else ""
+            if not _ip_allowed(client_ip, sec.ip_allowlist):
+                log.warning("blocked request from %s — not in security.ip_allowlist", client_ip)
+                return JSONResponse(
+                    {"detail": {"code": "ip_not_allowed", "message": "not permitted from this address"}},
+                    status_code=403,
+                )
+
+        # 2. HTTPS enforcement. `request.url.scheme` already accounts for
+        #    X-Forwarded-Proto from a trusted proxy (uvicorn proxy_headers),
+        #    so a TLS-terminating Caddy/Tailscale in front reads as https.
+        if settings is not None and settings.https_required and request.url.scheme != "https":
+            if request.method in ("GET", "HEAD"):
+                https_url = str(request.url.replace(scheme="https"))
+                return RedirectResponse(https_url, status_code=308)
+            return JSONResponse(
+                {"detail": {"code": "https_required",
+                            "message": "this server requires HTTPS"}},
+                status_code=400,
+            )
+
+        response = await call_next(request)
+
+        if sec is None or not sec.headers_enabled:
+            return response
+
+        # 3. Response hardening headers. setdefault throughout so a
+        #    reverse proxy that already sets one of these wins.
+        h = response.headers
+        h.setdefault("X-Content-Type-Options", "nosniff")
+        h.setdefault("X-Frame-Options", "DENY")
+        h.setdefault("Referrer-Policy", "no-referrer")
+        h.setdefault(
+            "Permissions-Policy",
+            "geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()",
+        )
+        h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        h.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        # An operator console has no business in a search index — and a
+        # public deployment WILL be crawled.
+        h.setdefault("X-Robots-Tag", "noindex, nofollow")
+        if sec.csp:
+            host = request.headers.get("host", "")
+            ws_self = f"ws://{host} wss://{host}" if host else "'self'"
+            h.setdefault("Content-Security-Policy", sec.csp.replace("{ws_self}", ws_self))
+        if request.url.path.startswith("/api/"):
+            # Telemetry, alarms and the session state are never cacheable —
+            # a shared proxy holding /api/status would serve one site's
+            # generator data to another.
+            h.setdefault("Cache-Control", "no-store")
+        if sec.hsts_enabled and request.url.scheme == "https":
+            hsts = f"max-age={max(0, int(sec.hsts_max_age))}"
+            if sec.hsts_include_subdomains:
+                hsts += "; includeSubDomains"
+            h.setdefault("Strict-Transport-Security", hsts)
+        return response
+
     app.include_router(status_routes.router)
     app.include_router(telemetry_routes.router)
     app.include_router(events_routes.router)
     app.include_router(control_routes.router)
     app.include_router(ats_routes.router)
     app.include_router(auth_routes.router)
+    app.include_router(users_routes.router)
     app.include_router(settings_routes.router)
     app.include_router(ws_routes.router)
 

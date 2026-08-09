@@ -96,15 +96,23 @@ H-100 answers.
    ```
    - Watch for `Hardware watchdog active (...)` near the end. If it says
      **NOT active**, note it — reboot applies it (the install asserts this now).
-2. Set the admin password + point at the bridge:
+2. Create the first operator account + point at the bridge:
    ```bash
-   sudo genwatch hash                       # paste the $2b$... hash into config
-   sudo nano /etc/genwatch/config.yaml      # admin_password_hash + modbus_tcp.host
+   sudo -u genwatch genwatch useradd <name> --role admin   # prompts twice, no echo
+   sudo nano /etc/genwatch/config.yaml                     # modbus_tcp.host
    sudo systemctl restart genwatch
    ```
-   - The service **refuses to boot** if `jwt_secret`/`admin_password_hash`
-     are unset or the `REPLACE_ME` placeholder — that's intended. The
-     installer sets `jwt_secret`; you set the password hash.
+   - The service **refuses to boot** if `jwt_secret` is unset/placeholder,
+     or if there is no enabled admin account — that's intended. The
+     installer sets `jwt_secret`; you create the account. Add the rest of
+     the crew with `--role operator` (control) or `--role viewer`
+     (read-only), or from Settings → Users once you're in.
+   - Upgrading an existing site? The old shared `admin_password_hash` is
+     migrated into an admin account on first boot (username from
+     `auth.bootstrap_username`, default `admin`) — the same password still
+     works, with a username in front of it.
+   - Commissioning a console that will be reachable from the internet?
+     Work through `docs/SECURITY.md` before cutover.
 3. Pre-flight + live probe:
    ```bash
    sudo genwatch doctor
@@ -377,7 +385,7 @@ commands yet.**
    safety suite, straight from the GenWatch Pi (stdlib only, no venv):
    ```bash
    # bench (simulated H-100 + live ATS-Pi):
-   GENWATCH_TEST_PASSWORD='<admin pw>' sudo -E python3 \
+   GENWATCH_TEST_USERNAME='<name>' GENWATCH_TEST_PASSWORD='<pw>' sudo -E python3 \
      deploy/scripts/acceptance_test.py --expect-mock true \
      --expected-unit-id 23 --local-checks
    # production cutover (real H-100): use --expect-mock false

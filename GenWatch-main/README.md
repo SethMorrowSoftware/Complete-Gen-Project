@@ -6,7 +6,7 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and missing/`REPLACE_ME` `admin_password_hash` refuse to boot in production; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (232 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and a production boot with no usable admin account refuse to start; per-operator accounts with roles, server-side revocable sessions, per-IP *and* per-account brute-force limits, optional TOTP, and a `security.public_exposure` gate that refuses an unsafe internet-facing config; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (395 tests).
 
 ---
 
@@ -182,7 +182,7 @@ The installer is idempotent — safe to re-run for upgrades. It:
 7. Copies the built frontend to `/usr/share/genwatch/ui/`.
 8. Provisions `/etc/genwatch/config.yaml` with a random `jwt_secret` (256 bits from CPython's CSPRNG) and `0640 genwatch:genwatch` perms.
 9. Installs the hardware-watchdog drop-in (`/etc/systemd/system.conf.d/10-genwatch-hwwatchdog.conf`) and re-execs pid 1 so the Pi's BCM2712 watchdog starts being petted. A kernel hang from this point on will hard-reset the Pi within ~15 s.
-10. Installs the systemd unit, runs `genwatch doctor` for a pre-flight report, and starts the service (after the admin password is set).
+10. Installs the systemd unit, runs `genwatch doctor` for a pre-flight report, and starts the service (once an operator account exists).
 
 You should see something like:
 
@@ -199,22 +199,23 @@ You should see something like:
   Config:    /etc/genwatch/config.yaml
   Mock:      False
   Transport: tcp 192.168.1.249:10001
-  Auth:      MISSING admin_password_hash — run: genwatch hash <password>
+  Auth:      MISSING or weak jwt_secret — run: genwatch gensecret
+  Accounts:  NONE — run: genwatch useradd <username> --role admin
   Registers: /opt/genwatch/genwatch/registers/h100.yaml
              35 read + 5 write, slave=100
   Modbus:    slave 100 responded with [0] (37ms)
 
-⚠  ADMIN PASSWORD NOT SET
+⚠  NO OPERATOR ACCOUNTS YET
 ```
 
-If you see `Modbus: NO RESPONSE`, jump to [§10 Troubleshooting](#10-troubleshooting). The installer continues regardless — the service just won't start until the admin password is set.
+If you see `Modbus: NO RESPONSE`, jump to [§10 Troubleshooting](#10-troubleshooting). The installer continues regardless — the service just won't start until an operator account exists.
 
 ### On an Ubuntu Server (TCP bridge)
 
 Ubuntu Server is a first-class target. `deploy/scripts/setup-ubuntu.sh` wraps the
 standard installer with an interactive, idempotent one-shot: it runs `install.sh`,
 then prompts for the H-100 gateway, the ATS-Pi companion, **MQTT status publishing**,
-and the admin password; writes `/etc/genwatch/config.yaml` (backing it up first);
+and the first admin account; writes `/etc/genwatch/config.yaml` (backing it up first);
 starts the service; and runs reachability + `genwatch doctor` checks. Safe to re-run.
 
 ```bash
@@ -232,20 +233,40 @@ the guided config step on top.
 
 ## 5. Initial configuration
 
-### 5.1 Set the admin password and the bridge target
+### 5.1 Create the first operator account and set the bridge target
+
+Every operator signs in with their own username and password. Accounts live in
+the service database, not in `config.yaml`:
 
 ```bash
-sudo genwatch hash                            # prompts for the password (no echo)
-# → $2b$12$XJZ... (paste this whole line)
+sudo -u genwatch genwatch useradd alice --role admin   # prompts twice, no echo
+sudo -u genwatch genwatch useradd dave  --role operator
+sudo -u genwatch genwatch userlist
+```
+
+Roles: **viewer** (read-only) · **operator** (+ start/stop/exercise/transfer and
+alarm ack) · **admin** (+ configuration, register map, user management). Give
+each person the lowest role that lets them do their job — a wall dashboard
+doesn't need to be able to stop the generator. Admins can create and manage
+accounts from **Settings → Users** afterwards.
+
+> **Upgrading an existing install?** Deployments that used the single shared
+> `auth.admin_password_hash` get it migrated into a real admin account on first
+> boot (username from `auth.bootstrap_username`, default `admin`). Your existing
+> password keeps working — you just type a username with it now. Create
+> per-person accounts, then clear `admin_password_hash` from `config.yaml`.
+
+> **Before putting this on the internet**, read [docs/SECURITY.md](docs/SECURITY.md)
+> — two-factor, HTTPS enforcement, lockout tuning, and the
+> `security.public_exposure` boot gate.
+
+Then point the service at your bridge:
+
+```bash
 sudo nano /etc/genwatch/config.yaml
 ```
 
-Running `genwatch hash <password>` with the password as an argv arg still works for scripted provisioning, but it leaks the plaintext into `~/.bash_history` and is briefly visible in `ps aux` — the interactive form above is the recommended path.
-
-Two things in the editor:
-
-1. Replace `admin_password_hash: "REPLACE_ME"` with the hash you just generated.
-2. Confirm the link block points at your bridge:
+Confirm the link block matches your hardware:
 
    ```yaml
    transport: tcp
@@ -282,7 +303,7 @@ http://genwatch.local:8000
 
 (Use the Pi's IP address if `.local` mDNS isn't working — `hostname -I` on the Pi prints it.)
 
-Log in with the password you set in §5.1.
+Log in with the username and password you created in §5.1.
 
 ### 5.4 Verify telemetry is live
 
@@ -330,6 +351,60 @@ mqtt:
 
 Verify from any subscriber, e.g. `mosquitto_sub -h <broker> -t facility/generator/status -v`,
 or use **Settings → MQTT → Send test** for a one-shot (non-retained) publish.
+
+### 5.6 Slack alerts (optional)
+
+Create a Slack app with the `chat:write` scope, install it to the workspace, invite
+the bot to your channel, and paste the `xoxb-…` token into **Settings → Alerts ·
+Slack** (or `config.yaml`). Everything here hot-reloads — no restart.
+
+**Transfer alerts** are the ones people actually wait for: the load just moved to
+the generator, or the utility is back. They're on by default, driven by the ATS-Pi's
+physical switch position when that companion is healthy and by the H-100's
+electrical readings otherwise, and each direction is separately controllable:
+
+```yaml
+slack:
+  enabled: true
+  bot_token: "xoxb-…"
+  channel: "#generator-alerts"
+
+  alert_on_load_source_change: true       # master switch
+  alert_on_transfer_to_generator: true    # utility → generator (the outage page)
+  alert_on_return_to_utility: true        # generator → utility (the all-clear)
+  alert_on_load_source_unknown: false     # instrumentation gap, not a transfer
+
+  channel_load_source: "#on-call"         # route transfers to their own channel
+  mention_on_transfer_to_generator: "<!channel>"   # what makes Slack actually notify
+  mention_on_return_to_utility: ""
+  load_source_debounce_s: 30              # settle time — see below
+```
+
+Mentions use Slack's syntax, not a plain `@name`: `<!channel>`, `<!here>`,
+`<@U024BE7LH>` for a person, `<!subteam^S012ABC3DE>` for a user group. Without one
+the message posts but nobody gets a push notification.
+
+`load_source_debounce_s` holds the alert and only sends it if the load source is
+still there when the timer fires. An ATS that hunts, or a utility browning out
+repeatedly, otherwise produces a burst of contradictory pages during the exact
+minutes you need a clear signal — and a flap that lands back where it started sends
+nothing at all. The message names where the load actually settled.
+
+**Sign-in alerts** are worth turning on whenever the console is reachable from the
+internet — that's how you learn about a password-spraying attempt from Slack rather
+than from the audit table afterwards:
+
+```yaml
+  alert_on_login_failure: true    # deduplicated per account per minute
+  alert_on_account_lockout: true  # the one that carries the signal
+  alert_on_login_success: false   # chatty at most sites
+  alert_on_user_change: true      # created/deleted/role/password/2FA
+  channel_security: "#genwatch-security"   # these name accounts and IPs
+```
+
+**Settings → Alerts → Test messages** posts through the real route for each alert
+type — channel override and mention included — so you can prove the plumbing before
+an outage tests it for you.
 
 ---
 
@@ -401,7 +476,7 @@ Every command is audit-logged with the operator, timestamp, action, the actual r
 - **Live** — Real-time operator console. Sparklines update every 1.5 s; main telemetry every 15 s. Top-right shows comms health and a STALE DATA badge if the live push has stopped.
 - **History** — Chart of any metric over 10 min to 30 days. SQLite-backed, decimated server-side.
 - **Events** — Append-only log of state transitions, alarms, comms changes, and operator commands.
-- **Settings** — Bridge endpoint, Modbus, register map, retention, Slack alerts. Changes saved to `/etc/genwatch/config.yaml`; the UI warns when a restart is required.
+- **Settings** — Bridge endpoint, Modbus, register map, retention, Slack alerts, operator accounts (admin), your own password / two-factor / active sessions, and a read-only security-posture summary. Changes saved to `/etc/genwatch/config.yaml`; the UI warns when a restart is required.
 
 ### CLI commands
 
@@ -409,8 +484,22 @@ All exposed via the `genwatch` wrapper installed by the installer. Run any with 
 
 ```bash
 genwatch serve                       # run the service (used by systemd)
-genwatch hash [<password>]           # bcrypt-hash a password for config (prompts if omitted)
 genwatch gensecret                   # generate a JWT signing secret (hex)
+genwatch hash [<password>]           # bcrypt-hash a password for the legacy
+                                     #   auth.admin_password_hash bootstrap credential
+
+# Accounts (operate on the service database — run as the genwatch user)
+genwatch useradd <name>              # create an account; prompts for the password
+        [--role viewer|operator|admin]
+        [--must-change-password]
+genwatch userlist                    # accounts, roles, lock state, 2FA, sessions
+genwatch userpasswd <name>           # set/reset a password (signs out their sessions)
+genwatch userrole <name> <role>      # change role
+genwatch userdisable/userenable <name>
+genwatch userunlock <name>           # clear a failed-login lockout
+genwatch userdel <name>
+genwatch usertotp <name>             # enroll two-factor; prints recovery codes once
+genwatch usertotp-off <name>         # remove it (the lost-phone path)
 genwatch doctor [--config PATH]      # pre-flight diagnostics: config, DB, register map,
                                      #   bridge reachability, live Modbus probe
 genwatch modbusdump [--addr 0xNN]    # read raw registers from the controller.
@@ -485,7 +574,14 @@ wdctl                                   # shows SoC watchdog status
 
 ## 8. Security recommendations
 
-Castle Generator Monitor is designed for a **trusted LAN** deployment. By default it listens on `0.0.0.0:8000` over plain HTTP and issues the session cookie with `HttpOnly` + `SameSite=Strict`; the `Secure` flag is added automatically when the request reached us over HTTPS (Caddy or `tailscale serve` in front of the monitor). This is appropriate for a Pi sitting in the same building as the generator on a private network. Do not expose port 8000 to the public internet without adding one of the following:
+> **Putting this console on the open internet?** [**docs/SECURITY.md**](docs/SECURITY.md)
+> is the full checklist — named accounts, two-factor, TLS enforcement, lockout
+> tuning, the `security.public_exposure` boot gate, and the IP allowlist. This
+> section covers the LAN-and-VPN baseline that everything there builds on.
+
+Out of the box the service listens on `0.0.0.0:8000` over plain HTTP and issues the session cookie with `HttpOnly` + `SameSite=Strict`; the `Secure` flag (and the `__Host-` cookie prefix) are added automatically when the request reached us over HTTPS (Caddy or `tailscale serve` in front of the monitor). That default is appropriate for a Pi sitting in the same building as the generator on a private network.
+
+Access is authenticated in every configuration: named per-operator accounts with roles, bcrypt-hashed passwords, a per-IP rate limiter and a per-account lockout, server-side revocable sessions, and an optional TOTP second factor. Exposing port 8000 publicly is nonetheless a deliberate step — an authenticated operator can start a 100 kW diesel and command a 600 A transfer switch. Do it by working through `docs/SECURITY.md`, or avoid it entirely with one of the following:
 
 ### 8.1 Use Tailscale for remote access
 
@@ -525,14 +621,18 @@ Restricts the monitor's port to your LAN ranges.
 
 - **Authentication required on every `/api/*` endpoint** except `/api/health` (and the auth endpoints themselves). The trusted-LAN deployment model no longer leaves telemetry, events, alarms, and config readable to anonymous LAN clients. `/api/health` stays open for external uptime monitoring but only returns `{ok, mock}` to anon callers — version, comms state, and DB size require a session.
 - **CSRF middleware** rejects any POST/PUT/DELETE/PATCH to `/api/*` whose `Origin` (or `Referer`) header isn't the request's own host or an entry in `cors_origins`. Defense in depth on top of `SameSite=Strict` so a misconfigured `cookie_samesite: lax` doesn't open a CSRF hole. Non-browser clients (curl, ansible) without `Origin`/`Referer` pass through — CSRF requires a victim browser.
-- **Login rate-limiter** — 5 attempts then 1 attempt per 3 minutes per source IP. State resets on service restart. *(Note: behind a reverse proxy the limiter sees the proxy's IP — restricts the limiter to a single global bucket. Use Tailscale or `ufw` for proxied deploys.)*
+- **Two-layer brute-force defence** — a per-IP token bucket (`auth.login_rate_burst` attempts, then one every `auth.login_rate_refill_seconds`) *and* a per-account escalating lockout (`auth.lockout_threshold` failures → `auth.lockout_seconds`, doubling to `auth.lockout_max_seconds`). The per-account layer is what a botnet rotating source addresses cannot sidestep. Failed second factors count toward it too. Unknown username, wrong password, and disabled account return an identical response — and the unknown-user path burns a real bcrypt verify so the timing matches as well, closing the account-enumeration oracle. *(Behind a reverse proxy, ensure it sets `X-Forwarded-For` and list its address in `GENWATCH_TRUSTED_PROXIES`, or every client collapses into one bucket.)*
 - **JWT secret refuses-to-boot when empty in production.** `sudo genwatch gensecret` → paste into `config.yaml` `jwt_secret:` → `sudo systemctl restart genwatch` rotates all sessions. Previously an empty secret silently generated an ephemeral one and logged a warning; that hid genuine config corruption under `Restart=always`. Mock mode (`GENWATCH_MOCK=true`) preserves the ephemeral fallback for dev / CI.
 - **Audit log** — `/var/lib/genwatch/db.sqlite` table `audit` records every login attempt (with source IP), every confirm-token issue/consume/evict, and every control command (with operator, action, register, word values, and result `ok`/`denied`/`failed`). SQLite `synchronous=FULL` means a power cut after a command can't lose the audit row.
 - **Server-side state validity** — every control command re-checks `engine_state` server-side *inside* the control lock (so two concurrent requests can't both pass the gate against a stale snapshot). Clicking "Start" while running returns HTTP 409 `invalid_state` and audit-logs the denial.
 - **Panel-mode gate** — every remote command re-checks the H-100 front-panel key-switch position; rejects with HTTP 409 `panel_mode_locked` unless the panel is in AUTO. Stops a stolen session (or a misclicked button) from quietly no-op'ing at the unit. See [§7 Panel key-switch gating](#panel-key-switch-gating).
 - **Confirm-token discipline** — 8-char hex tokens (`secrets.token_hex(4)`), 30 s TTL, single-use (`pop`-on-consume), operator-bound (issuer must match consumer), required on start / stop / exercise / transfer AND on alarm-ack. Replay returns 400 `token_invalid`.
 - **WebSocket hardening** — `/ws/live` validates `Origin` against the same allowlist as the CSRF middleware before accepting (browser-initiated cross-origin connects rejected), re-validates the session JWT every 60 s inside the message loop (an expired or secret-rotated token can't keep streaming live data through a long-lived socket), and logs a deprecation warning when the legacy `?token=` query parameter is used.
-- **Session cookie hardening** — `HttpOnly` (no JS access), `SameSite=Strict` by default, `Path=/`. The `Secure` flag is added automatically when the request reached the service over HTTPS (a Caddy / `tailscale serve` deployment terminating TLS gets it for free); override via `auth.cookie_secure: true|false` and `auth.cookie_samesite: strict|lax|none` if your topology needs it. SameSite=None is rejected at config load unless paired with Secure.
+- **Server-side sessions** — every session is recorded in the database and keyed by the token's `jti`, so logout is a real revocation (the cookie stops working immediately), an idle timeout applies (`auth.idle_timeout_minutes`, default 60) on top of the absolute `auth.session_hours` — measured on operator activity, not on the live WebSocket, so an unattended Live view doesn't hold a session open forever — and both the operator (Settings → My Account) and an admin (Settings → Users) can see and kill live sessions. A password change or an account being disabled bumps the account's token epoch, invalidating every existing session instantly — including the WebSocket feed.
+- **Session cookie hardening** — `HttpOnly` (no JS access), `SameSite=Strict` by default, `Path=/`. The `Secure` flag is added automatically when the request reached the service over HTTPS (a Caddy / `tailscale serve` deployment terminating TLS gets it for free), and over HTTPS the cookie also takes the `__Host-` name prefix, which browsers enforce as Secure + Path=/ + no Domain so a sibling hostname can't plant a session cookie on the console. Override via `auth.cookie_secure: true|false` and `auth.cookie_samesite: strict|lax|none` if your topology needs it. SameSite=None is rejected at config load unless paired with Secure.
+- **Optional TOTP second factor** — RFC 6238, works with any authenticator app, single-use codes (replay refused), ten hashed recovery codes issued once at enrollment. `auth.require_totp: true` makes it mandatory; accounts that haven't enrolled are refused rather than exempted. See [docs/SECURITY.md](docs/SECURITY.md).
+- **Response hardening headers** — CSP (`frame-ancestors 'none'`, `script-src 'self'`, per-request `connect-src` for the same-origin WebSocket), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, COOP/CORP, `X-Robots-Tag: noindex`, `Cache-Control: no-store` on `/api/*`, and HSTS on requests that arrived over HTTPS (never on plain HTTP, so it can't brick a LAN deployment).
+- **`security.public_exposure`** — declares the console internet-facing and turns the deployment checklist into boot-time refusals: mock mode, `cookie_secure: false`, wildcard CORS, disabled lockout, or no admin account all stop the service from starting, and weaker-but-survivable settings log warnings. Optional `security.require_https` (implied) and `security.ip_allowlist` round it out.
 - **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `ProcSubset=pid`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, empty `CapabilityBoundingSet` / `AmbientCapabilities`, `UMask=0027`, `SystemCallFilter=@system-service` with `~@mount @swap @reboot @raw-io @cpu-emulation @obsolete` negation, `OOMScoreAdjust=-200`, narrow `DeviceAllow` list (covers FTDI/CH340/CP210x USB-serial chips + the Pi 5 on-board UART for the legacy serial fallback), `MemoryMax=512M`, `TasksMax=128`.
 - **Supply-chain pinning** — `package-lock.json` and `backend/requirements.lock` (with sha256 hashes for every transitive) are both committed. `install.sh` uses `npm ci --ignore-scripts` (refuses to drift, blocks postinstall scripts from running under root) and `pip install --require-hashes` (refuses a wheel whose sha256 doesn't match a typosquat / compromised mirror).
 
@@ -580,7 +680,8 @@ If you've locally edited `registers/h100.yaml` (e.g. fixed a bit position for yo
 ```bash
 # Log in once to get a session cookie
 curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
-     -H 'Content-Type: application/json' -d '{"password":"<your-admin-pw>"}'
+     -H 'Content-Type: application/json' -H 'X-Requested-With: curl' \
+     -d '{"username":"<your-username>","password":"<your-password>"}'
 
 # Validate the new map (static rule check + per-register live read probe)
 curl -b cookies.txt http://localhost:8000/api/registers/verify
@@ -593,7 +694,7 @@ curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
 
 ### Backups + schema
 
-Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades — it contains the `jwt_secret`, the `admin_password_hash`, and (if configured) the Slack `bot_token`.
+Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades — it contains the `jwt_secret` and (if configured) the Slack `bot_token` and MQTT password. Operator accounts live in `/var/lib/genwatch/db.sqlite` — back that up too, or you'll be recreating logins after a restore.
 
 The SQLite database at `/var/lib/genwatch/db.sqlite` carries the audit log + history. Lose it and you lose forensic records of every operator command — back it up before SD-card rotations:
 
@@ -670,14 +771,23 @@ sudo systemctl restart genwatch
 
 For dev / CI, set `GENWATCH_MOCK=true` to re-enable the ephemeral fallback.
 
-### Symptom: Service exits with `auth.admin_password_hash is unset or still the 'REPLACE_ME' placeholder`
+### Symptom: Service exits with `No enabled admin account exists …`
 
-No usable admin password is set. Production refuses to start with a missing / placeholder / non-bcrypt hash, because the service would otherwise come up "healthy" while every login returns 401 — a silent lockout. Set it:
+There is no way to sign in. Production refuses to start rather than coming up "healthy" — green systemd unit, green watchdog — while every login returns 401, which looks like a hang rather than a config problem. Create an account:
 
 ```bash
-sudo genwatch hash                           # prompts (no echo) → $2b$... hash
-sudo nano /etc/genwatch/config.yaml          # paste into auth.admin_password_hash
+sudo -u genwatch genwatch useradd alice --role admin   # prompts twice, no echo
 sudo systemctl restart genwatch
+```
+
+The same commands get you back in after locking yourself out — they talk to the
+database directly and need no login:
+
+```bash
+sudo -u genwatch genwatch userlist            # who exists, who's locked
+sudo -u genwatch genwatch userunlock alice    # clear a failed-login lockout
+sudo -u genwatch genwatch userpasswd alice    # set a new password
+sudo -u genwatch genwatch usertotp-off alice  # lost phone: clear the second factor
 ```
 
 ### Symptom: Install fails with `Unsupported OS tag`
@@ -852,7 +962,8 @@ Then verify the new map, then hot-reload (admin auth required):
 ```bash
 # Log in once to get a session cookie
 curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
-     -H 'Content-Type: application/json' -d '{"password":"<admin-pw>"}'
+     -H 'Content-Type: application/json' -H 'X-Requested-With: curl' \
+     -d '{"username":"<your-username>","password":"<your-password>"}'
 
 # Static + live verification — read-only, doesn't affect the poller
 curl -b cookies.txt http://localhost:8000/api/registers/verify
@@ -929,6 +1040,8 @@ cd backend
 - `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping (incl. withheld when the engine-state block fails), batch-fallback behavior, fan-out-failure preserves last-good value, per-tier TTL evicts stale values, short reads count as failures, a partial fan-out doesn't flip comms to LOST, Modbus client lock released between retry attempts, JWT-secret + admin-hash refuse-to-boot in production (empty / `REPLACE_ME` placeholder / too-short / non-bcrypt), control rejected when H-100 comms LOST, env-vars override `config.yaml` (with nested deep-merge), SQLite 1m→1h rollup + long-span read + chunked prune + WAL checkpoint, `panel` CLI command output (text + JSON), `genwatch hash` stdin-prompt behavior.
 - `test_ats_control.py` — ATS-Pi command write side (Phase 3): each command writes the expected ICD register/value, confirm-token flow (valid / invalid / single-use), role gating (force-transfer admin-only), force-transfer healthy-utility override guard, comms-loss / non-authoritative link returns 502 / 409.
 - `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, dedupe window suppresses flap, retry deadline abandons stale messages, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
+- `test_slack_alerts.py` — the configurable transfer alerts: per-direction gating, channel routing and its fallback, mention placement (inside the message body, where Slack actually reads it), the settle-time debounce collapsing a flap to silence and reporting the settled state after hunting, security-alert gating and per-account dedupe, and the per-route test message.
+- `test_users_auth.py` — password policy, username rules, the last-admin guard rails, the login decision (enumeration resistance, escalating lockout, lockout disclosed only to a correct password), TOTP against the RFC 6238 vectors plus replay refusal and single-use recovery codes, the legacy-hash bootstrap, the HTTP surface (logout revoking a replayed cookie, password change revoking other sessions, role gates, must-change-password gate, idle timeout), the response-hardening middleware, the account CLI, and the public-exposure boot refusals.
 - `test_ats_service.py` — ATS-Pi snapshot decode, authoritative-gate, ICD §5.4 minor-version semantics, reboot detection.
 - `test_ats_loadsource_precedence.py` — load-source derivation precedence (ATS-Pi authoritative vs H-100 fallback), `ATS_LOADSOURCE_DISAGREE` debounce + gating on `normal_available`, handover across comms-lost / comms-recovered windows.
 - `test_ats_icd_alignment.py` — pins ICD doc ↔ YAML ↔ mock alignment so a register addition can't silently drift one of them.
@@ -986,7 +1099,13 @@ Every `/api/*` endpoint requires authentication except `/api/health` (a delibera
 | Method | Path                                          | Auth   | Notes                                                       |
 |--------|-----------------------------------------------|--------|-------------------------------------------------------------|
 | GET    | `/api/health`                                 | public | Anon callers see `{ok, mock}` only. Authed callers get comms state, uptime, version, DB size. |
-| POST   | `/api/auth/login`                             | public | `{ password }` → session cookie (rate-limited per IP)       |
+| POST   | `/api/auth/login`                             | public | `{ username, password, totp? }` → session cookie. Rate-limited per IP *and* per account; `totp` only after a `totp_required` challenge |
+| POST   | `/api/auth/password`                          | self   | `{ current_password, new_password }` — revokes every other session, re-issues this one |
+| GET    | `/api/auth/sessions`                          | self   | Your live sessions (id, IP, client, last used)              |
+| DELETE | `/api/auth/sessions`                          | self   | Sign out everywhere else                                    |
+| POST   | `/api/auth/totp/enroll`                       | self   | Start TOTP enrollment → `{secret, uri}` (not yet active)    |
+| POST   | `/api/auth/totp/confirm`                      | self   | `{ code }` → activates, returns recovery codes **once**     |
+| POST   | `/api/auth/totp/disable`                      | self   | `{ password }` — refused while `auth.require_totp` is on    |
 | POST   | `/api/auth/logout`                            | public | Clear cookie                                                |
 | GET    | `/api/auth/me`                                | public | Identity (200 with `{authenticated: false}` when anonymous) |
 | GET    | `/api/status`                                 | op+    | Full live snapshot (engine, comms, reading, panel, alarms, ATS) |
@@ -1003,15 +1122,25 @@ Every `/api/*` endpoint requires authentication except `/api/health` (a delibera
 | POST   | `/api/ats/inhibit`                            | op+    | Body `{ confirm_token, assert }` — assert/release inhibit (maintained) |
 | POST   | `/api/ats/force-transfer`                     | admin  | Body `{ confirm_token, assert, override }`; 409 unless `override` while utility available |
 | POST   | `/api/ats/bypass-delay`                       | op+    | ATS-Pi momentary bypass of the transfer time delay          |
-| GET    | `/api/config`                                 | op+    | Effective config (bot_token + jwt_secret never returned)    |
+| GET    | `/api/users`                                  | admin  | Accounts (never hashes or TOTP secrets)                     |
+| POST   | `/api/users`                                  | admin  | `{ username, password, role, must_change_password }`        |
+| PATCH  | `/api/users/{name}`                           | admin  | `{ role?, disabled? }` — last-admin protected               |
+| POST   | `/api/users/{name}/password`                  | admin  | Reset; flags must-change and revokes their sessions         |
+| POST   | `/api/users/{name}/unlock`                    | admin  | Clear a failed-login lockout                                |
+| POST   | `/api/users/{name}/revoke-sessions`           | admin  | Sign the account out everywhere                             |
+| POST   | `/api/users/{name}/totp/disable`              | admin  | Lost-phone path; audited and Slack-alerted                  |
+| DELETE | `/api/users/{name}`                           | admin  | Delete — last-admin protected, no self-delete               |
+| GET    | `/api/config`                                 | op+    | Effective config (secrets never returned)                   |
 | PUT    | `/api/config`                                 | admin  | Update on-disk config; Slack hot-reloads, others need restart |
-| POST   | `/api/slack/test`                             | admin  | Send a synchronous test message; returns `{ok, detail}`     |
+| POST   | `/api/slack/test?kind=`                       | admin  | Test message through a real route: `generic`, `load_source` (transfer channel + mention) or `security`. Returns `{ok, detail}` |
 | GET    | `/api/registers`                              | op+    | Current register map + last-read values for each            |
 | POST   | `/api/registers/reload`                       | admin  | Re-parse YAML, propagate to live poller + state + control   |
 | GET    | `/api/registers/verify`                       | admin  | Static + live read verification (skipped in mock mode)      |
 | WS     | `/ws/live`                                    | cookie | Cookie auth + Origin allowlist + 60 s periodic re-validation. Pushes `hello` / `snapshot` / `transition` / `alarm` / `alarm-cleared` / `comms` / ATS events / `ping`. |
 
-Roles: **viewer**, **operator**, **admin** — `require_operator` admits `{operator, admin}`, `require_admin` admits `{admin}`. Today only one login exists (the `admin_password_hash` account, issued `role="admin"`), so both gates pass for every authenticated user. The distinction is forward-compat scaffolding for a future second password; pick the gate that documents intent (admin for secret-handling, operator for operational reads/writes) rather than treating `require_admin` as a real privilege boundary until the split lands.
+Roles: **viewer** (reads: status, telemetry, events, alarms), **operator** (+ everything that moves hardware: control verbs, ATS commands, alarm ack), **admin** (+ configuration, register map, user management). Each account carries its own role, so these are real privilege boundaries — `require_viewer` admits any authenticated account, `require_operator` admits `{operator, admin}`, `require_admin` admits `{admin}` only.
+
+An account flagged `must_change_password` (the default after an admin reset) gets `403 password_change_required` on **every** endpoint except `/api/auth/me`, `/api/auth/logout` and `/api/auth/password`, so a temporary password can't be used as a working credential.
 
 All errors return JSON `{ detail: { code, message } }` with appropriate HTTP status. Common error codes:
 
@@ -1025,6 +1154,14 @@ All errors return JSON `{ detail: { code, message } }` with appropriate HTTP sta
 | 403    | `csrf_blocked`        | Mutating request whose `Origin`/`Referer` is not in the allowlist |
 | 409    | `invalid_state`       | Control verb not valid for current engine state (e.g. start while running) |
 | 409    | `panel_mode_locked`   | Panel key switch is MANUAL / OFF / unknown — remote writes blocked |
+| 403    | `password_change_required` | Account still holds a temporary password                    |
+| 403    | `ip_not_allowed`      | Source address not in `security.ip_allowlist`                    |
+| 400    | `https_required`      | `security.require_https` is on and the request arrived over HTTP |
+| 401    | `invalid_credentials` | Unknown username, wrong password, or disabled account (identical for all three, by design) |
+| 401    | `totp_required`       | Password accepted; send the 6-digit code as `totp`               |
+| 401    | `totp_invalid`        | Wrong / replayed second factor (counts toward lockout)           |
+| 409    | `last_admin`          | Refused: would leave no enabled admin                            |
+| 429    | `account_locked`      | Account locked after repeated failures; `Retry-After` gives the wait |
 | 429    | `rate_limited`        | Too many login attempts; `Retry-After` header gives the wait    |
 | 502    | `modbus_failed`       | Underlying Modbus write returned an error                        |
 

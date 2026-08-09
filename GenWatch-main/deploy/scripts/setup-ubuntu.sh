@@ -7,7 +7,7 @@
 #   - transport: tcp  → a serial-to-Ethernet gateway (Lantronix/Moxa/ser2net)
 #                       wired to the H-100's RS-232 PC port
 #   - the ATS-Pi companion (optional)
-#   - the admin password
+#   - the first admin account (username + password)
 # …then starts the service and runs diagnostics.
 #
 # It is interactive (sensible defaults, everything overridable) and idempotent —
@@ -69,11 +69,15 @@ if [[ "${MQTT_ENABLED,,}" == y* ]]; then
   MQTT_TOPIC="$(ask "  Status topic" "${MQTT_TOPIC:-facility/generator/status}")"
 fi
 
-# ── Admin password (no echo). Blank = leave whatever is already configured. ──
+# ── First admin account. Operators sign in with their own username and
+# ── password; accounts live in the service database, not in config.yaml.
+# ── A blank password leaves existing accounts untouched.
+ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PW="${ADMIN_PW:-}"
 if [ -z "$ADMIN_PW" ]; then
   echo
-  read -rsp "$(printf '\033[1mAdmin password\033[0m (blank = keep existing): ')" ADMIN_PW; echo
+  ADMIN_USER="$(ask "Admin username" "$ADMIN_USER")"
+  read -rsp "$(printf '\033[1mAdmin password\033[0m (blank = keep existing accounts): ')" ADMIN_PW; echo
   if [ -n "$ADMIN_PW" ]; then
     read -rsp "$(printf '\033[1mConfirm password\033[0m: ')" PW2; echo
     [ "$ADMIN_PW" = "$PW2" ] || die "passwords did not match"
@@ -86,7 +90,7 @@ echo "    transport      -> tcp   ($GW_HOST:$GW_PORT, RTU framing)"
 echo "    modbus.slave   -> $SLAVE"
 [ -n "$ATS_HOST" ] && echo "    ats            -> $ATS_HOST:$ATS_PORT  expected_unit_id=$ATS_UNIT" || echo "    ats            -> disabled"
 [ -n "$MQTT_HOST" ] && echo "    mqtt           -> $MQTT_HOST:$MQTT_PORT  topic=$MQTT_TOPIC" || echo "    mqtt           -> disabled"
-echo "    admin password -> $( [ -n "$ADMIN_PW" ] && echo 'will be set' || echo 'unchanged' )"
+echo "    admin account  -> $( [ -n "$ADMIN_PW" ] && echo "$ADMIN_USER (created or password reset)" || echo 'unchanged' )"
 echo
 [ "$(ask "Proceed?" "yes")" = "yes" ] || die "aborted — nothing changed"
 
@@ -97,21 +101,12 @@ GENWATCH_ALLOW_UNSUPPORTED_OS=1 bash "$INSTALLER"
 [ -f "$CONFIG" ]  || die "installer did not create $CONFIG — check its output above."
 [ -x "$VENV_PY" ] || die "venv python missing at $VENV_PY — installer may have failed."
 
-# ── 2. Hash the admin password (if one was given) ───────────────────────────
-ADMIN_HASH=""
-if [ -n "$ADMIN_PW" ]; then
-  say "Hashing the admin password…"
-  # Extract just the bcrypt hash, regardless of any surrounding text.
-  ADMIN_HASH="$(genwatch hash "$ADMIN_PW" 2>/dev/null | grep -oE '\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}' | head -1 || true)"
-  [ -n "$ADMIN_HASH" ] || die "could not generate a password hash via 'genwatch hash'."
-fi
-
 # ── 3. Write the config (backup first; preserves owner/mode + jwt_secret) ────
 say "Configuring $CONFIG (a timestamped backup is saved alongside)…"
 GW_HOST="$GW_HOST" GW_PORT="$GW_PORT" SLAVE="$SLAVE" \
 ATS_ENABLED="$ATS_ENABLED" ATS_HOST="$ATS_HOST" ATS_PORT="$ATS_PORT" ATS_UNIT="$ATS_UNIT" \
 MQTT_ENABLED="$MQTT_ENABLED" MQTT_HOST="$MQTT_HOST" MQTT_PORT="$MQTT_PORT" MQTT_TOPIC="$MQTT_TOPIC" \
-ADMIN_HASH="$ADMIN_HASH" CONFIG="$CONFIG" \
+CONFIG="$CONFIG" \
 "$VENV_PY" - <<'PY'
 import os, time, shutil, yaml
 cfg = os.environ["CONFIG"]
@@ -143,14 +138,45 @@ if os.environ.get("MQTT_ENABLED", "").lower().startswith("y"):
     m["port"] = int(os.environ["MQTT_PORT"])
     m["topic"] = os.environ["MQTT_TOPIC"]
 
-h = os.environ.get("ADMIN_HASH", "")
-if h:
-    d.setdefault("auth", {})["admin_password_hash"] = h
-
 yaml.safe_dump(d, open(cfg, "w"), default_flow_style=False, sort_keys=False)
 os.chmod(cfg, st.st_mode); os.chown(cfg, st.st_uid, st.st_gid)
 print("    config written.")
 PY
+
+# ── 3b. Create (or reset) the admin account ─────────────────────────
+# Goes through the same service layer as `genwatch useradd` and the Users
+# page, so the password policy and the last-admin guard rails apply here
+# too. Run non-interactively via the venv so this script keeps its
+# "every prompt has a matching env var" contract.
+if [ -n "$ADMIN_PW" ]; then
+  say "Creating the admin account '$ADMIN_USER'…"
+  ADMIN_USER="$ADMIN_USER" ADMIN_PW="$ADMIN_PW" CONFIG="$CONFIG" \
+  sudo -u genwatch -E "$VENV_PY" - <<'ACCOUNT_PY' || die "could not create the admin account (see the error above)."
+import os, sys
+from genwatch.config import load
+from genwatch.db import Database
+from genwatch.services.users import UserError, UserService, ensure_bootstrap_user
+
+settings = load(os.environ["CONFIG"])
+db = Database(settings.db_path)
+ensure_bootstrap_user(db, settings.auth)
+svc = UserService(db, settings.auth)
+name, pw = os.environ["ADMIN_USER"], os.environ["ADMIN_PW"]
+try:
+    if svc.get(name) is None:
+        svc.create(username=name, password=pw, role="admin", created_by="setup-ubuntu.sh")
+        print(f"    created admin account {name!r}.")
+    else:
+        svc.set_password(name, pw)
+        svc.set_role(name, "admin", actor="setup-ubuntu.sh")
+        print(f"    reset the password for existing account {name!r}.")
+except UserError as e:
+    print(f"    {e}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    db.close()
+ACCOUNT_PY
+fi
 
 # ── 4. Start + verify ────────────────────────────────────────────────────────
 say "Starting genwatch…"
@@ -161,7 +187,7 @@ if systemctl is-active --quiet genwatch; then
 else
   warn "genwatch did not start — showing the last log lines:"
   journalctl -u genwatch -n 20 --no-pager || true
-  die "service failed to start (often a missing admin password or unreachable gateway). Fix and re-run."
+  die "service failed to start (often no admin account yet — run: sudo -u genwatch genwatch useradd <name> --role admin — or an unreachable gateway). Fix and re-run."
 fi
 
 echo

@@ -1,29 +1,35 @@
 """Shared dependencies: app state, auth, role gates."""
 from __future__ import annotations
 
-from typing import Literal
-
 from fastapi import Depends, HTTPException, Request, status
 
-from ..services.auth import AuthError, decode_token
+from ..services import session as session_svc
+from ..services.auth import AuthError
 
 
 class Principal:
-    def __init__(self, *, operator: str, role: Literal["viewer", "operator", "admin"]):
+    def __init__(self, *, operator: str, role: str, uid: int = 0, jti: str = "",
+                 must_change_password: bool = False):
         self.operator = operator
         self.role = role
+        self.uid = uid
+        self.jti = jti
+        self.must_change_password = must_change_password
 
 
 def get_app_state(request: Request):
     return request.app.state
 
 
-def get_principal(request: Request) -> Principal:
-    """Read auth from cookie *or* Authorization header.
+def _resolve(request: Request) -> Principal:
+    """Read auth from cookie *or* Authorization header, then validate the
+    session server-side.
 
-    Cookie is the normal path for the browser UI; header is for CLI use.
+    Cookie is the normal path for the browser UI; the bearer header is for
+    CLI / automation use. Both carry the same token and get the same
+    treatment — a revoked session is revoked for `curl` too.
     """
-    token = request.cookies.get("genwatch_session")
+    token = session_svc.read_cookie(request.cookies)
     if not token:
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
@@ -31,37 +37,64 @@ def get_principal(request: Request) -> Principal:
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
 
-    settings = request.app.state.settings
     try:
-        payload = decode_token(secret=settings.auth.jwt_secret, token=token)
+        sp = session_svc.validate(
+            db=request.app.state.db, settings=request.app.state.settings, token=token
+        )
     except AuthError as e:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(e))
 
     return Principal(
-        operator=payload.get("sub", "operator"),
-        role=payload.get("role", "viewer"),
+        operator=sp.operator,
+        role=sp.role,
+        uid=sp.uid,
+        jti=sp.jti,
+        must_change_password=sp.must_change_password,
     )
 
 
-# Role model — single password today, structured for two roles tomorrow.
+def get_principal_allow_password_change(request: Request) -> Principal:
+    """Authenticated, even when the account still owes a password change.
+
+    Only the endpoints that let an operator *fix* that state use this —
+    /api/auth/password, /api/auth/me, logout, TOTP enrollment.
+    """
+    return _resolve(request)
+
+
+def get_principal(request: Request) -> Principal:
+    p = _resolve(request)
+    if p.must_change_password:
+        # A temporary password handed out by an admin is a credential that
+        # has, by definition, been transmitted through some side channel
+        # (chat, phone, a sticky note). Everything except changing it is
+        # blocked until it's replaced — otherwise "must change password"
+        # is a suggestion, and a leaked temp password is a live account.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "password_change_required",
+                "message": "you must set a new password before using the console",
+            },
+        )
+    return p
+
+
+# Role model — three roles, enforced against the account's stored role.
 #
-# The only login path (api/auth.py:login) authenticates against
-# `admin_password_hash` and issues a token with `role="admin"`. There is
-# no operator login and no viewer login. So in current behavior:
+#   viewer    read-only: live view, history, events
+#   operator  the above + control commands (start/stop/exercise/transfer,
+#             alarm ack) — everything that can move hardware
+#   admin     the above + configuration, register map, and user management
 #
-#   - require_operator admits {operator, admin} → admits the one real
-#     login, plus any future operator role.
-#   - require_admin admits {admin} only → also admits the one real login.
-#
-# Both gates therefore pass for every authenticated user TODAY — the
-# distinction is forward-compat scaffolding for the day a second password
-# is introduced. Keep that in mind when adding new sensitive endpoints:
-# `require_admin` is not a stronger gate than `require_operator` until
-# the second login lands. Pick the gate that documents *intent* (which
-# role SHOULD this require if we later split them) rather than treating
-# `require_admin` as a real boundary. Anything secret-handling should use
-# require_admin; anything operational (control, read, status) should use
-# require_operator.
+# Note the ordering assumption: require_operator admits {operator, admin},
+# require_admin admits {admin} only. Pick the gate that documents intent —
+# anything secret-handling or account-touching is admin; anything
+# operational is operator; plain reads need only an authenticated session.
+def require_viewer(p: Principal = Depends(get_principal)) -> Principal:
+    return p
+
+
 def require_operator(p: Principal = Depends(get_principal)) -> Principal:
     if p.role not in ("operator", "admin"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "operator role required")

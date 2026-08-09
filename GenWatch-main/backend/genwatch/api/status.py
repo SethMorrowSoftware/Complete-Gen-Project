@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, Depends, Request
 
 from ..db import COLUMN_MAP
-from .deps import Principal, get_principal, require_operator
+from .deps import Principal, get_principal, require_viewer
 
 
 def reading_to_ui(values: dict) -> dict:
@@ -44,7 +44,7 @@ router = APIRouter(prefix="/api", tags=["status"])
 
 
 @router.get("/status")
-async def status(request: Request, p: Principal = Depends(require_operator)) -> dict:
+async def status(request: Request, p: Principal = Depends(require_viewer)) -> dict:
     st = request.app.state
     sm = st.state_machine
     snap = sm.snap
@@ -196,7 +196,7 @@ async def health(request: Request) -> dict:
     """
     st = request.app.state
     # Best-effort auth probe: don't raise if no/expired cookie — just
-    # return the minimal payload. We can't use Depends(require_operator)
+    # return the minimal payload. We can't use Depends(require_viewer)
     # because that 401s on miss, which would defeat the anonymous probe.
     try:
         get_principal(request)
@@ -218,7 +218,7 @@ async def health(request: Request) -> dict:
 
 
 @router.get("/columns")
-async def columns(p: Principal = Depends(require_operator)) -> dict:
+async def columns(p: Principal = Depends(require_viewer)) -> dict:
     """Expose the telemetry column map so the frontend can render any
     metric without hard-coding the names."""
     return {"columns": COLUMN_MAP}

@@ -9,6 +9,17 @@ Usage:
   python -m genwatch panel         # decoded snapshot for cross-check vs H-100 LCD
   python -m genwatch doctor        # pre-flight diagnostics (hardware, config, DB)
   python -m genwatch version       # print version
+
+Accounts (operate on the service database — run as the genwatch user):
+  python -m genwatch useradd <name> [--role admin|operator|viewer]
+  python -m genwatch userlist
+  python -m genwatch userpasswd <name>      # set/reset a password
+  python -m genwatch userrole <name> <role>
+  python -m genwatch userdisable <name> / userenable <name>
+  python -m genwatch userunlock <name>      # clear a failed-login lockout
+  python -m genwatch userdel <name>
+  python -m genwatch usertotp <name>        # enroll a TOTP second factor
+  python -m genwatch usertotp-off <name>    # remove it (lost phone)
 """
 from __future__ import annotations
 
@@ -110,6 +121,9 @@ def main() -> int:
         print(__version__)
         return 0
 
+    if cmd in _USER_COMMANDS:
+        return _user_command(cmd, args[1:])
+
     if cmd == "modbusdump":
         return _modbusdump(args[1:])
 
@@ -123,6 +137,212 @@ def main() -> int:
         return _doctor(args[1:])
 
     print(__doc__, file=sys.stderr)
+    return 2
+
+
+# ─── Account management ───────────────────────────────────────────────────
+# These talk to the service database directly rather than the HTTP API, so
+# they work before anyone can log in — which is the whole point: this is
+# how the first account gets created, and how an admin who locked
+# themselves out gets back in without a factory reset.
+
+_USER_COMMANDS = {
+    "useradd", "userlist", "userdel", "userpasswd", "userrole",
+    "userdisable", "userenable", "userunlock", "usertotp", "usertotp-off",
+}
+
+
+def _open_user_service(config_path: str | None = None):
+    """(UserService, Database, Settings) against the configured DB.
+
+    Falls back to ``GENWATCH_CONFIG_PATH`` — the same variable the systemd
+    unit sets — so `genwatch useradd` operates on the database the running
+    service actually uses, rather than silently creating accounts in a
+    second database nobody authenticates against.
+    """
+    import os
+
+    from .config import load
+    from .db import Database
+    from .services.users import UserService, ensure_bootstrap_user
+
+    settings = load(config_path or os.environ.get("GENWATCH_CONFIG_PATH"))
+    db = Database(settings.db_path)
+    ensure_bootstrap_user(db, settings.auth)
+    return UserService(db, settings.auth), db, settings
+
+
+def _prompt_new_password(username: str, svc) -> str | None:
+    """Prompt twice, no echo, and enforce the same policy the API does.
+
+    Returns None if the operator aborted. Re-prompts on a policy failure
+    rather than exiting, so a rejected password doesn't cost a restart.
+    """
+    import getpass
+
+    from .services.users import UserError
+
+    if not sys.stdin.isatty():
+        print(
+            "error: setting a password requires an interactive terminal "
+            "(so the plaintext never lands in shell history or `ps aux`).",
+            file=sys.stderr,
+        )
+        return None
+    for _ in range(3):
+        try:
+            pw1 = getpass.getpass(f"New password for {username}: ")
+            pw2 = getpass.getpass("Confirm password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted", file=sys.stderr)
+            return None
+        if pw1 != pw2:
+            print("error: passwords do not match — try again", file=sys.stderr)
+            continue
+        try:
+            svc._check_password(pw1, username=username)
+        except UserError as e:
+            print(f"error: {e}", file=sys.stderr)
+            continue
+        return pw1
+    print("error: too many attempts", file=sys.stderr)
+    return None
+
+
+def _user_command(cmd: str, args: list[str]) -> int:
+    import argparse
+
+    from .services.users import UserError
+
+    p = argparse.ArgumentParser(prog=f"genwatch {cmd}")
+    p.add_argument("--config", default=None, help="config.yaml path")
+    if cmd in ("useradd", "userdel", "userpasswd", "userrole", "userdisable",
+               "userenable", "userunlock", "usertotp", "usertotp-off"):
+        p.add_argument("username")
+    if cmd == "useradd":
+        p.add_argument("--role", default="operator", choices=("viewer", "operator", "admin"))
+        p.add_argument("--must-change-password", action="store_true",
+                       help="force a password change at first sign-in")
+    if cmd == "userrole":
+        p.add_argument("role", choices=("viewer", "operator", "admin"))
+    if cmd == "userpasswd":
+        p.add_argument("--must-change-password", action="store_true",
+                       help="force the operator to set their own on first sign-in")
+    opts = p.parse_args(args)
+
+    svc, db, settings = _open_user_service(opts.config)
+    try:
+        return _run_user_command(cmd, opts, svc, db, settings)
+    except UserError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+
+
+def _run_user_command(cmd: str, opts, svc, db, settings) -> int:
+    import time
+
+    if cmd == "userlist":
+        users = svc.list_users()
+        if not users:
+            print("(no accounts — create one with: genwatch useradd <username> --role admin)")
+            return 0
+        print(f"{'USERNAME':<20} {'ROLE':<9} {'STATE':<10} {'2FA':<5} {'LAST SIGN-IN':<20} SESSIONS")
+        now = time.time()
+        for u in users:
+            if u["disabled"]:
+                state = "disabled"
+            elif float(u["locked_until"] or 0) > now:
+                state = f"locked {int((float(u['locked_until']) - now) / 60) + 1}m"
+            elif u["must_change_password"]:
+                state = "must-chpw"
+            else:
+                state = "active"
+            last = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(u["last_login_at"]))
+                if u["last_login_at"] else "never"
+            )
+            sessions = len(db.sessions_for_user(int(u["id"])))
+            print(
+                f"{u['username']:<20} {u['role']:<9} {state:<10} "
+                f"{'on' if u['totp_enabled'] else 'off':<5} {last:<20} {sessions}"
+            )
+        return 0
+
+    if cmd == "useradd":
+        password = _prompt_new_password(opts.username, svc)
+        if password is None:
+            return 1
+        u = svc.create(
+            username=opts.username,
+            password=password,
+            role=opts.role,
+            must_change_password=opts.must_change_password,
+            created_by="cli",
+        )
+        print(f"created {u['username']} (role={u['role']})")
+        if settings.auth.require_totp:
+            print(f"note: auth.require_totp is on — enroll with: genwatch usertotp {u['username']}")
+        return 0
+
+    if cmd == "userpasswd":
+        svc.get_or_raise(opts.username)  # fail fast before prompting
+        password = _prompt_new_password(opts.username, svc)
+        if password is None:
+            return 1
+        svc.set_password(opts.username, password, must_change=opts.must_change_password)
+        print(f"password updated for {opts.username} — all their sessions were signed out")
+        return 0
+
+    if cmd == "userrole":
+        u = svc.set_role(opts.username, opts.role, actor="cli")
+        print(f"{u['username']} is now {u['role']}")
+        return 0
+
+    if cmd in ("userdisable", "userenable"):
+        disabled = cmd == "userdisable"
+        u = svc.set_disabled(opts.username, disabled, actor="cli")
+        print(f"{u['username']} {'disabled' if disabled else 'enabled'}")
+        return 0
+
+    if cmd == "userunlock":
+        u = svc.unlock(opts.username)
+        print(f"{u['username']} unlocked")
+        return 0
+
+    if cmd == "userdel":
+        svc.delete(opts.username, actor="cli")
+        print(f"deleted {opts.username}")
+        return 0
+
+    if cmd == "usertotp":
+        out = svc.begin_totp_enrollment(opts.username, issuer=settings.auth.totp_issuer)
+        print("Scan this in your authenticator app (or enter the secret by hand):\n")
+        print(f"  {out['uri']}\n")
+        print(f"  secret: {out['secret']}\n")
+        if not sys.stdin.isatty():
+            print("error: confirming enrollment needs an interactive terminal.", file=sys.stderr)
+            return 2
+        try:
+            code = input("Enter the 6-digit code to confirm: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted — enrollment not activated", file=sys.stderr)
+            return 130
+        codes = svc.confirm_totp_enrollment(opts.username, code)
+        print("\nTwo-factor is now ON for this account.")
+        print("Save these single-use recovery codes somewhere safe — they are the")
+        print("only way back in if the phone is lost, and they are NOT shown again:\n")
+        for c in codes:
+            print(f"  {c}")
+        return 0
+
+    if cmd == "usertotp-off":
+        svc.disable_totp(opts.username, actor="cli")
+        print(f"two-factor disabled for {opts.username}")
+        return 0
+
+    print(f"unknown account command: {cmd}", file=sys.stderr)
     return 2
 
 
@@ -159,17 +379,52 @@ def _doctor(args: list[str]) -> int:
 
     # --- Auth ---
     auth = settings.auth
-    pw_ok = bool(auth.admin_password_hash and auth.admin_password_hash != "REPLACE_ME")
-    sec_ok = bool(auth.jwt_secret and auth.jwt_secret != "REPLACE_ME")
-    if pw_ok and sec_ok:
-        print("  Auth:     configured")
+    sec_ok = bool(auth.jwt_secret and auth.jwt_secret != "REPLACE_ME" and len(auth.jwt_secret) >= 32)
+    if not sec_ok:
+        print("  Auth:     MISSING or weak jwt_secret — run: genwatch gensecret")
+        rc = 1
+
+    # Accounts live in the database now; the legacy hash only seeds the
+    # first one. Report what a login would actually find.
+    try:
+        from .db import Database as _Db
+        from .services.users import ensure_bootstrap_user as _bootstrap
+
+        _db = _Db(settings.db_path)
+        _bootstrap(_db, auth)
+        n_users = _db.user_count()
+        n_admins = _db.count_enabled_admins()
+        n_totp = sum(1 for u in _db.user_list() if u["totp_enabled"])
+        _db.close()
+        if n_admins == 0:
+            print("  Accounts: NONE — run: genwatch useradd <username> --role admin")
+            rc = 1
+        else:
+            print(f"  Accounts: {n_users} account(s), {n_admins} enabled admin(s), "
+                  f"{n_totp} with two-factor")
+            if auth.require_totp and n_totp < n_users:
+                print(f"            WARNING: auth.require_totp is on but {n_users - n_totp} "
+                      "account(s) have not enrolled — they cannot sign in")
+                rc = 1
+    except Exception as e:  # noqa: BLE001
+        print(f"  Accounts: could not read ({e})")
+        rc = 1
+
+    # --- Internet exposure posture ---
+    sec = settings.security
+    if sec.public_exposure:
+        print("  Exposure: PUBLIC (security.public_exposure: true)")
+        print(f"            https_required={settings.https_required} "
+              f"require_totp={auth.require_totp} "
+              f"lockout={auth.lockout_seconds}s "
+              f"idle_timeout={auth.idle_timeout_minutes}min")
+        if not settings.https_required:
+            print("            WARNING: plain HTTP is still accepted")
+        if not auth.require_totp:
+            print("            WARNING: no second factor required")
     else:
-        if not pw_ok:
-            print("  Auth:     MISSING admin_password_hash — run: genwatch hash <password>")
-            rc = 1
-        if not sec_ok:
-            print("  Auth:     MISSING jwt_secret — run: genwatch gensecret")
-            rc = 1
+        print("  Exposure: private (LAN / VPN). Set security.public_exposure: true "
+              "before exposing this to the internet.")
 
     # --- Register map ---
     try:

@@ -7,9 +7,13 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
-import type { MqttConfigView, MqttUpdate, SlackConfigView, SlackUpdate } from "../types";
+import type { MeBody, MqttConfigView, MqttUpdate, SlackConfigView, SlackUpdate } from "../types";
+import { AccountSection } from "./AccountSection";
+import { UsersSection } from "./UsersSection";
 
-type Section = "link" | "modbus" | "registers" | "retention" | "alerts" | "mqtt";
+type Section =
+  | "link" | "modbus" | "registers" | "retention" | "alerts" | "mqtt"
+  | "account" | "users" | "security";
 type Transport = "serial" | "tcp";
 
 interface Config {
@@ -20,12 +24,33 @@ interface Config {
   modbus_tcp: { host: string; port: number; timeout_s: number; connect_timeout_s: number; framer: string };
   modbus: { slave: number; read_fc: number; prime_poll_ms: number; base_poll_ms: number; retries: number; register_file: string };
   retention: { raw_days: number; rollup_1m_days: number; rollup_1h_days: number; audit_days: number };
-  auth: { operatorName: string; sessionHours: number; passwordConfigured: boolean; jwtSecretConfigured: boolean };
+  auth: {
+    operatorName: string;
+    sessionHours: number;
+    idleTimeoutMinutes: number;
+    passwordConfigured: boolean;
+    jwtSecretConfigured: boolean;
+    requireTotp: boolean;
+    passwordMinLength: number;
+    lockoutThreshold: number;
+    lockoutSeconds: number;
+    accountCount: number;
+  };
+  security: {
+    publicExposure: boolean;
+    requireHttps: boolean;
+    headersEnabled: boolean;
+    hstsEnabled: boolean;
+    ipAllowlistCount: number;
+  };
   slack: SlackConfigView;
   mqtt: MqttConfigView;
 }
 
-export function SettingsView() {
+export function SettingsView({ auth, onAuthChanged }: {
+  auth: MeBody;
+  onAuthChanged: () => void;
+}) {
   const [section, setSection] = useState<Section>("link");
   const [cfg, setCfg] = useState<Config | null>(null);
   const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate; mqtt: MqttUpdate }>>({});
@@ -76,6 +101,7 @@ export function SettingsView() {
     }
   };
 
+  const isAdmin = auth.role === "admin";
   const sections: Array<{ id: Section; label: string; icon: any }> = [
     { id: "link", label: "Modbus Link", icon: "cable" },
     { id: "modbus", label: "Modbus", icon: "cpu" },
@@ -83,6 +109,14 @@ export function SettingsView() {
     { id: "retention", label: "Retention", icon: "history" },
     { id: "alerts", label: "Alerts · Slack", icon: "bell" },
     { id: "mqtt", label: "MQTT", icon: "wave" },
+    { id: "account", label: "My Account", icon: "user" },
+    // Account administration and the security posture are admin-only —
+    // the endpoints behind them are too, so a non-admin would just see
+    // a page of 403s.
+    ...(isAdmin ? ([
+      { id: "users", label: "Users", icon: "user" },
+      { id: "security", label: "Security", icon: "lock" },
+    ] as Array<{ id: Section; label: string; icon: any }>) : []),
   ];
 
   return (
@@ -157,6 +191,11 @@ export function SettingsView() {
               set={(patch) => setDirty((d) => ({ ...d, mqtt: { ...(d.mqtt || {}), ...patch } }))}
             />
           )}
+          {section === "account" && (
+            <AccountSection auth={auth} onAuthChanged={onAuthChanged} />
+          )}
+          {section === "users" && isAdmin && <UsersSection me={auth.operator ?? ""} />}
+          {section === "security" && isAdmin && <SecuritySection cfg={cfg} />}
         </div>
       </div>
     </>
@@ -458,6 +497,87 @@ function formatValue(v: number): string {
   return v.toFixed(2);
 }
 
+// Read-only posture readout. These live in config.yaml rather than the UI
+// on purpose: a misconfigured `require_https` or IP allowlist can lock
+// every operator out, and the recovery path for that must be a text editor
+// on the Pi, not a console you can no longer reach.
+function SecuritySection({ cfg }: { cfg: Config }) {
+  const a = cfg.auth;
+  const s = cfg.security;
+  const rows: Array<{ label: string; ok: boolean | null; value: string; desc: string }> = [
+    {
+      label: "Exposure mode", ok: null,
+      value: s.publicExposure ? "public (internet-facing)" : "private (LAN / VPN)",
+      desc: "security.public_exposure — turns the deployment checklist below into boot-time refusals.",
+    },
+    {
+      label: "HTTPS required", ok: s.requireHttps, value: s.requireHttps ? "yes" : "no",
+      desc: "Plain-HTTP requests are refused (GET redirects, writes are rejected). Terminate TLS with Caddy or tailscale serve.",
+    },
+    {
+      label: "Two-factor required", ok: a.requireTotp, value: a.requireTotp ? "yes" : "no",
+      desc: "auth.require_totp — enroll every account first (My Account → two-factor), then turn it on.",
+    },
+    {
+      label: "Account lockout", ok: a.lockoutSeconds > 0,
+      value: a.lockoutSeconds > 0 ? `${a.lockoutThreshold} tries → ${Math.round(a.lockoutSeconds / 60)} min` : "disabled",
+      desc: "Escalating lockout per account, counted across source addresses.",
+    },
+    {
+      label: "Session limits", ok: a.idleTimeoutMinutes > 0,
+      value: `${a.sessionHours} h max · ${a.idleTimeoutMinutes || "no"} min idle`,
+      desc: "Sessions are server-side: logout, a password change, or an admin revoke kills them immediately.",
+    },
+    {
+      label: "Response hardening", ok: s.headersEnabled, value: s.headersEnabled ? "on" : "off",
+      desc: "CSP, frame-ancestors none, nosniff, no-referrer, no-store on API responses" + (s.hstsEnabled ? ", HSTS on HTTPS." : "."),
+    },
+    {
+      label: "IP allowlist", ok: null,
+      value: s.ipAllowlistCount ? `${s.ipAllowlistCount} entr${s.ipAllowlistCount === 1 ? "y" : "ies"}` : "not set",
+      desc: "security.ip_allowlist — optional network filter. Loopback always passes so a bad entry can't lock you out.",
+    },
+    {
+      label: "Password policy", ok: null, value: `${a.passwordMinLength}+ characters`,
+      desc: "Also rejects common passwords, keyboard runs, and passwords containing the username.",
+    },
+    {
+      label: "Accounts", ok: a.accountCount > 0, value: `${a.accountCount}`,
+      desc: "Named operator accounts. The legacy shared password is only used to seed the first admin on upgrade.",
+    },
+    {
+      label: "Legacy shared password", ok: !a.passwordConfigured,
+      value: a.passwordConfigured ? "still in config.yaml" : "cleared",
+      desc: "auth.admin_password_hash is unused once accounts exist — clear it so a stale credential isn't sitting on disk.",
+    },
+  ];
+
+  return (
+    <div className="settings-section">
+      <div className="settings-head">
+        <h2>Security posture</h2>
+        <p>
+          What this server is currently enforcing. These settings are edited in{" "}
+          <span className="mono">{cfg.configPath || "/etc/genwatch/config.yaml"}</span> and
+          applied on restart — deliberately not from this page, because a wrong value here
+          would lock you out of the page you'd need to fix it. See{" "}
+          <span className="mono">docs/SECURITY.md</span> for the exposure checklist.
+        </p>
+      </div>
+      {rows.map((r) => (
+        <div className="field-row" key={r.label}>
+          <div className="lbl">{r.label} <span className="desc">{r.desc}</span></div>
+          <div className="flex ai-c gap-8">
+            {r.ok === null
+              ? <Pill tone="info">{r.value}</Pill>
+              : <Pill tone={r.ok ? "ok" : "warn"}>{r.value}</Pill>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SlackSection({
   v, dirty, set,
 }: {
@@ -472,21 +592,23 @@ function SlackSection({
   const tokenWasSet = v.botTokenConfigured;
   const tokenDirty = dirty.bot_token !== undefined;
   const [revealing, setRevealing] = useState(!tokenWasSet);
-  const [testing, setTesting] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
 
-  const runTest = async () => {
-    setTesting(true);
+  const runTest = async (kind: "generic" | "load_source" | "security" = "generic") => {
+    setTesting(kind);
     setTestResult(null);
     try {
-      const r = await api.testSlack();
+      const r = await api.testSlack(kind);
       setTestResult(r);
     } catch (e: any) {
       setTestResult({ ok: false, detail: e?.body?.detail ?? e?.message ?? "test failed" });
     } finally {
-      setTesting(false);
+      setTesting(null);
     }
   };
+  const testDisabled = testing != null || !v.enabled || !v.channel ||
+    (!v.botTokenConfigured && !dirty.bot_token);
 
   return (
     <div className="settings-section">
@@ -589,23 +711,161 @@ function SlackSection({
       <SlackToggle label="Modbus comms"
         desc="Comms lost / recovered"
         value={v.alertOnCommsLost} onChange={(b) => set({ alert_on_comms_lost: b })} />
-      <SlackToggle label="Load source"
-        desc="Utility ↔ generator transitions (outage / restoration)"
-        value={v.alertOnLoadSourceChange} onChange={(b) => set({ alert_on_load_source_change: b })} />
       <SlackToggle label="Engine state transitions"
         desc="Every stopped/cranking/running/cooling change — chatty"
         value={v.alertOnStateChange} onChange={(b) => set({ alert_on_state_change: b })} />
 
-      <div className="field-row" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
-        <div className="lbl">Test message
-          <span className="desc">posts a one-shot message to the configured channel</span></div>
+      {/* ── Transfer alerts ─────────────────────────────────────────── */}
+      <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <h2 style={{ fontSize: 13 }}>Transfer alerts · utility ↔ generator</h2>
+        <p>
+          The alert people actually wait for: the load just moved to the generator, or the
+          utility is back. Driven by the ATS-Pi's physical switch position when that companion
+          is healthy, and by the H-100's electrical readings otherwise — it works either way.
+        </p>
+      </div>
+
+      <SlackToggle label="Transfer alerts"
+        desc="Master switch for the two below"
+        value={v.alertOnLoadSourceChange} onChange={(b) => set({ alert_on_load_source_change: b })} />
+      <SlackToggle label="→ Load on GENERATOR"
+        desc="Utility failed or a transfer was commanded — the outage page"
+        value={v.alertOnTransferToGenerator}
+        onChange={(b) => set({ alert_on_transfer_to_generator: b })} />
+      <SlackToggle label="→ Load on UTILITY"
+        desc="Retransfer — the all-clear"
+        value={v.alertOnReturnToUtility}
+        onChange={(b) => set({ alert_on_return_to_utility: b })} />
+      <SlackToggle label="→ Load source UNKNOWN"
+        desc="Both the ATS position and the electrical inference went dark — usually instrumentation, not a transfer"
+        value={v.alertOnLoadSourceUnknown}
+        onChange={(b) => set({ alert_on_load_source_unknown: b })} />
+
+      <div className="field-row">
+        <div className="lbl">
+          Transfer channel
+          <span className="desc">
+            Send transfer alerts somewhere other than the main channel — e.g. an on-call
+            channel that pages. Blank = use the channel above.
+          </span>
+        </div>
+        <input
+          className="input"
+          placeholder="(same as main channel)"
+          value={v.channelLoadSource}
+          onChange={(e) => set({ channel_load_source: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Mention on → GENERATOR
+          <span className="desc">
+            Slack mention syntax, not a plain @name: <span className="mono">&lt;!channel&gt;</span>,{" "}
+            <span className="mono">&lt;!here&gt;</span>,{" "}
+            <span className="mono">&lt;@U024BE7LH&gt;</span>, or{" "}
+            <span className="mono">&lt;!subteam^S012ABC3DE&gt;</span>. This is what makes Slack
+            actually push a notification.
+          </span>
+        </div>
+        <input
+          className="input mono"
+          placeholder="<!channel>"
+          value={v.mentionOnTransferToGenerator}
+          onChange={(e) => set({ mention_on_transfer_to_generator: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Mention on → UTILITY <span className="desc">usually quieter than the outage page</span></div>
+        <input
+          className="input mono"
+          placeholder="(none)"
+          value={v.mentionOnReturnToUtility}
+          onChange={(e) => set({ mention_on_return_to_utility: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Settle time
+          <span className="desc">
+            Hold a transfer alert this long and only send it if the load source is still there.
+            An ATS that hunts, or a utility browning out repeatedly, otherwise produces a burst
+            of contradictory pages during the minutes you most need a clear signal. A flap that
+            lands back where it started sends nothing at all. 0 = send immediately.
+          </span>
+        </div>
         <div className="flex ai-c gap-8">
-          <button
-            className="btn"
-            disabled={testing || !v.enabled || !v.channel || (!v.botTokenConfigured && !dirty.bot_token)}
-            onClick={runTest}
-          >
-            {testing ? "Sending…" : "Send test"}
+          <input
+            className="input mono"
+            type="number" min={0} max={600} step={5}
+            style={{ width: 110 }}
+            value={v.loadSourceDebounceS}
+            onChange={(e) => set({ load_source_debounce_s: Number(e.target.value) })}
+          />
+          <span className="desc">seconds</span>
+        </div>
+      </div>
+
+      {/* ── Security alerts ─────────────────────────────────────────── */}
+      <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <h2 style={{ fontSize: 13 }}>Sign-in &amp; account alerts</h2>
+        <p>
+          Worth turning on whenever this console is reachable from the internet — it's how you
+          find out about a password-spraying attempt from Slack instead of from the audit table
+          afterwards. Failures are deduplicated per account per minute so an attack can't flood
+          the channel.
+        </p>
+      </div>
+
+      <SlackToggle label="Failed sign-ins"
+        desc="Wrong password, bad 2FA code, unknown account"
+        value={v.alertOnLoginFailure} onChange={(b) => set({ alert_on_login_failure: b })} />
+      <SlackToggle label="Account lockouts"
+        desc="An account locked after repeated failures — the one that matters"
+        value={v.alertOnAccountLockout} onChange={(b) => set({ alert_on_account_lockout: b })} />
+      <SlackToggle label="Successful sign-ins"
+        desc="Every sign-in, with source IP — chatty at most sites"
+        value={v.alertOnLoginSuccess} onChange={(b) => set({ alert_on_login_success: b })} />
+      <SlackToggle label="Account changes"
+        desc="Created, deleted, role changed, password reset, 2FA turned on or off"
+        value={v.alertOnUserChange} onChange={(b) => set({ alert_on_user_change: b })} />
+
+      <div className="field-row">
+        <div className="lbl">
+          Security channel
+          <span className="desc">
+            These messages name accounts and source addresses — an admin-only channel is
+            usually the right home. Blank = use the main channel.
+          </span>
+        </div>
+        <input
+          className="input"
+          placeholder="(same as main channel)"
+          value={v.channelSecurity}
+          onChange={(e) => set({ channel_security: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <div className="lbl">
+          Test messages
+          <span className="desc">
+            Each button posts through the real route for that alert type — channel override and
+            mention included — so you can prove the plumbing before an outage tests it for you.
+            Save your changes first.
+          </span>
+        </div>
+        <div className="flex ai-c gap-8" style={{ flexWrap: "wrap" }}>
+          <button className="btn" disabled={testDisabled} onClick={() => runTest("generic")}>
+            {testing === "generic" ? "Sending…" : "General"}
+          </button>
+          <button className="btn" disabled={testDisabled} onClick={() => runTest("load_source")}>
+            {testing === "load_source" ? "Sending…" : "Transfer route"}
+          </button>
+          <button className="btn" disabled={testDisabled} onClick={() => runTest("security")}>
+            {testing === "security" ? "Sending…" : "Security route"}
           </button>
           {testResult && (
             <Pill tone={testResult.ok ? "ok" : "alarm"}>

@@ -221,6 +221,41 @@ export interface MeBody {
   authenticated: boolean;
   operator?: string;
   role?: Role;
+  // Set when an admin issued a temporary password — the console stays
+  // locked to the change-password screen until it's replaced.
+  mustChangePassword?: boolean;
+  totpEnabled?: boolean;
+  totpRequired?: boolean;
+  recoveryCodesRemaining?: number;
+}
+
+// One row of GET /api/users (admin only). Never carries the password
+// hash or the TOTP secret — the API doesn't return them at all.
+export interface UserRow {
+  username: string;
+  role: Role;
+  disabled: boolean;
+  mustChangePassword: boolean;
+  totpEnabled: boolean;
+  lockedUntil: number;
+  failedAttempts: number;
+  lastLoginAt: number | null;
+  lastLoginIp: string;
+  passwordChangedAt: number;
+  createdAt: number;
+  createdBy: string;
+  activeSessions: number;
+  recoveryCodesRemaining: number;
+}
+
+export interface SessionRow {
+  id: string;
+  current: boolean;
+  createdAt: number;
+  lastSeenAt: number;
+  expiresAt: number;
+  ip: string;
+  userAgent: string;
 }
 
 // Returned by GET /api/config.slack — the bot token itself is never
@@ -237,6 +272,20 @@ export interface SlackConfigView {
   alertOnCommand: boolean;
   alertOnCommsLost: boolean;
   alertOnLoadSourceChange: boolean;
+  // Transfer alerts — per-direction gating, routing, mentions, debounce.
+  alertOnTransferToGenerator: boolean;
+  alertOnReturnToUtility: boolean;
+  alertOnLoadSourceUnknown: boolean;
+  channelLoadSource: string;
+  mentionOnTransferToGenerator: string;
+  mentionOnReturnToUtility: string;
+  loadSourceDebounceS: number;
+  // Sign-in / account security alerts.
+  alertOnLoginFailure: boolean;
+  alertOnAccountLockout: boolean;
+  alertOnLoginSuccess: boolean;
+  alertOnUserChange: boolean;
+  channelSecurity: string;
 }
 
 // Sent in PUT /api/config.slack — omit a field to leave it unchanged.
@@ -253,6 +302,18 @@ export interface SlackUpdate {
   alert_on_command?: boolean;
   alert_on_comms_lost?: boolean;
   alert_on_load_source_change?: boolean;
+  alert_on_transfer_to_generator?: boolean;
+  alert_on_return_to_utility?: boolean;
+  alert_on_load_source_unknown?: boolean;
+  channel_load_source?: string;
+  mention_on_transfer_to_generator?: string;
+  mention_on_return_to_utility?: string;
+  load_source_debounce_s?: number;
+  alert_on_login_failure?: boolean;
+  alert_on_account_lockout?: boolean;
+  alert_on_login_success?: boolean;
+  alert_on_user_change?: boolean;
+  channel_security?: string;
 }
 
 // Returned by GET /api/config.mqtt — the broker password is never

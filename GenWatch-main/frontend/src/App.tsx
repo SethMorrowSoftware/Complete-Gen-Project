@@ -5,6 +5,7 @@ import { api, setUnauthorizedHandler } from "./api/client";
 import { BrandMark, Icon, IconButton } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
 import type { MeBody } from "./types";
+import { ChangePasswordView } from "./views/ChangePasswordView";
 import { EventsView } from "./views/EventsView";
 import { HistoryView } from "./views/HistoryView";
 import { LiveView } from "./views/LiveView";
@@ -15,6 +16,11 @@ type View = "live" | "history" | "events" | "settings";
 type Theme = "dark" | "light";
 
 const THEME_KEY = "genwatch.theme";
+
+// Most frequently a present operator will refresh their session. Well
+// under any sane `auth.idle_timeout_minutes` (default 60), and rare
+// enough that continuous mouse movement costs one request every 5 min.
+const KEEPALIVE_MS = 5 * 60 * 1000;
 
 function readTheme(): Theme {
   try {
@@ -57,6 +63,41 @@ export function App() {
 
   useEffect(() => { applyTheme(theme, false); }, []);
 
+  // Idle-timeout keepalive. The server expires a session that hasn't been
+  // *used* for `auth.idle_timeout_minutes`, and deliberately does not
+  // count the live WebSocket as use — otherwise the Live view, the one
+  // page people leave open on an unattended screen, would keep a session
+  // alive forever. So an operator who is actually present (moving,
+  // typing, switching tabs back) refreshes it here, throttled to one
+  // request per KEEPALIVE_MS.
+  //
+  // It doubles as an expiry detector: /api/auth/me answers 200 with
+  // authenticated:false rather than 401, so without this a lapsed session
+  // would leave a frozen, live-looking dashboard until the operator
+  // clicked something.
+  useEffect(() => {
+    if (!auth?.authenticated) return;
+    let last = 0;
+    let cancelled = false;
+    const ping = () => {
+      const now = Date.now();
+      if (now - last < KEEPALIVE_MS) return;
+      last = now;
+      api.me()
+        .then((m) => { if (!cancelled && !m.authenticated) setAuth({ authenticated: false }); })
+        .catch(() => { /* transient network error — the next event retries */ });
+    };
+    const onVisible = () => { if (document.visibilityState === "visible") ping(); };
+    const events: Array<keyof DocumentEventMap> = ["pointerdown", "keydown", "wheel"];
+    events.forEach((e) => document.addEventListener(e, ping, { passive: true }));
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      events.forEach((e) => document.removeEventListener(e, ping));
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [auth?.authenticated]);
+
   const toggleTheme = () => {
     setTheme((t) => {
       const next: Theme = t === "dark" ? "light" : "dark";
@@ -77,6 +118,18 @@ export function App() {
   if (!auth.authenticated) {
     return <LoginView onLoggedIn={() => api.me().then(setAuth)} />;
   }
+  if (auth.mustChangePassword) {
+    // The server blocks every other endpoint for this account until the
+    // temporary password is replaced, so showing the console here would
+    // just render a wall of 403s.
+    return (
+      <ChangePasswordView
+        operator={auth.operator ?? "operator"}
+        onDone={() => api.me().then(setAuth)}
+        onCancel={async () => { await api.logout(); setAuth({ authenticated: false }); }}
+      />
+    );
+  }
   return (
     <Shell
       auth={auth}
@@ -84,17 +137,21 @@ export function App() {
       setView={setView}
       theme={theme}
       onToggleTheme={toggleTheme}
+      // Settings can change the signed-in account (password, 2FA), so it
+      // needs a way to refresh the identity the shell is rendering from.
+      onAuthChanged={() => { void api.me().then(setAuth); }}
       onLogout={async () => { await api.logout(); setAuth({ authenticated: false }); }}
     />
   );
 }
 
-function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
+function Shell({ auth, view, setView, theme, onToggleTheme, onAuthChanged, onLogout }: {
   auth: MeBody;
   view: View;
   setView: (v: View) => void;
   theme: Theme;
   onToggleTheme: () => void;
+  onAuthChanged: () => void;
   onLogout: () => Promise<void>;
 }) {
   const live = useLiveData();
@@ -266,7 +323,9 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
             {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} role={auth.role ?? "viewer"} stale={stale} panelStale={panelStale} />}
             {view === "history" && <HistoryView />}
             {view === "events" && <EventsView />}
-            {view === "settings" && <SettingsView />}
+            {view === "settings" && (
+              <SettingsView auth={auth} onAuthChanged={onAuthChanged} />
+            )}
           </div>
         )}
       </main>
