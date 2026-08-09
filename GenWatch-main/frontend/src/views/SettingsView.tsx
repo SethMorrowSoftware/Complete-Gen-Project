@@ -19,6 +19,30 @@ type Section =
   | "account" | "users" | "security";
 type Transport = "serial" | "tcp";
 
+// GET /api/config returns camelCase (`alertOnAlarm`); PUT /api/config takes
+// snake_case (`alert_on_alarm`). The edit buffer holds the PUT shape, so a
+// plain `{...view, ...patch}` merge left the camelCase key stale and the
+// controls read straight through it — every toggle and every multi-word
+// field (siteLabel, payloadOn, clientId, tlsInsecure…) sat frozen at its
+// saved value while the pending edit was invisibly correct underneath.
+// The change still *saved*, which is the worst version of the bug: the
+// switch doesn't move, so nobody trusts it enough to press Save.
+//
+// Write both spellings so the merged object answers to whichever the
+// control asks for. Sections whose view is already snake_case (fuel) keep
+// working because the raw key is written too.
+const toCamel = (k: string) => k.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
+
+function applyPatch<V extends object>(view: V, patch?: object): V {
+  if (!patch) return view;
+  const out: Record<string, unknown> = { ...(view as Record<string, unknown>) };
+  for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+    out[k] = v;
+    out[toCamel(k)] = v;
+  }
+  return out as V;
+}
+
 interface Config {
   configPath: string;
   mock: boolean;
@@ -74,9 +98,9 @@ export function SettingsView({ auth, onAuthChanged }: {
     modbus_tcp: { ...cfg.modbus_tcp, ...(dirty.modbus_tcp || {}) },
     modbus: { ...cfg.modbus, ...(dirty.modbus || {}) },
     retention: { ...cfg.retention, ...(dirty.retention || {}) },
-    slack: { ...cfg.slack, ...(dirty.slack || {}) },
-    fuel: { ...cfg.fuel, ...(dirty.fuel || {}) },
-    mqtt: { ...cfg.mqtt, ...(dirty.mqtt || {}) },
+    slack: applyPatch(cfg.slack, dirty.slack),
+    fuel: applyPatch(cfg.fuel, dirty.fuel),
+    mqtt: applyPatch(cfg.mqtt, dirty.mqtt),
   };
   const hasDirty = Object.keys(dirty).length > 0;
 
