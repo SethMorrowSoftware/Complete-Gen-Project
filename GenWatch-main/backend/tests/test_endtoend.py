@@ -40,7 +40,7 @@ async def client(app_env):
 
 
 async def _login(c: httpx.AsyncClient) -> None:
-    r = await c.post("/api/auth/login", json={"password": "test"})
+    r = await c.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200, r.text
 
 
@@ -215,7 +215,7 @@ async def test_csrf_blocks_post_with_no_origin_and_no_custom_header(app_env):
         async with app.router.lifespan_context(app):
             # Log in as a compliant client (sends the header) to get the cookie.
             r = await c.post(
-                "/api/auth/login", json={"password": "test"},
+                "/api/auth/login", json={"username": "admin", "password": "test"},
                 headers={"X-Requested-With": "pytest"},
             )
             assert r.status_code == 200, r.text

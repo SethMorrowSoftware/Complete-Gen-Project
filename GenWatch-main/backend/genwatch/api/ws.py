@@ -10,10 +10,12 @@ clients but logs a deprecation warning — URLs leak into proxy access
 logs and browser history. Prefer the cookie path or a future
 one-time-ticket endpoint.
 
-After the initial decode at connect time, the token is re-validated
+After the initial check at connect time, the session is re-validated
 periodically inside the message loop (REVALIDATE_EVERY_S) so a
-logout-revoked or expired token can't keep streaming live data for
-the rest of the original session window.
+logout-revoked, disabled or expired session can't keep streaming live
+data for the rest of the original session window. Validation goes
+through services/session.py, the same path the HTTP routes use — a
+session revoked from the Users page stops the live feed too.
 """
 from __future__ import annotations
 
@@ -24,7 +26,8 @@ import time
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
-from ..services.auth import AuthError, decode_token
+from ..services import session as session_svc
+from ..services.auth import AuthError
 
 log = logging.getLogger("genwatch.ws")
 
@@ -43,14 +46,13 @@ def _current_token(websocket: WebSocket, fallback_query_token: str | None) -> st
     """Pull the live auth material for re-validation.
 
     The cookie value lives on the WebSocket object and is captured at
-    connect time — Starlette does not refresh it mid-stream. So the
-    "periodic re-validation" really verifies the SAME credential is
-    still valid against the current jwt_secret and not past its `exp`.
-    A real revocation story (server-side jti table) would supersede
-    this; until then the periodic decode catches expiry + secret
-    rotation cases.
+    connect time — Starlette does not refresh it mid-stream — so the
+    periodic re-validation re-checks the SAME credential. That is enough
+    now that sessions are server-side: the recheck sees a revoked `jti`,
+    a bumped `token_epoch`, a disabled account, or an idle timeout, not
+    just expiry and secret rotation.
     """
-    return websocket.cookies.get("genwatch_session") or fallback_query_token
+    return session_svc.read_cookie(websocket.cookies) or fallback_query_token
 
 
 def _origin_allowed(websocket: WebSocket) -> tuple[bool, str | None]:
@@ -89,14 +91,24 @@ def _origin_allowed(websocket: WebSocket) -> tuple[bool, str | None]:
 
 
 async def _authed(websocket: WebSocket, token: str | None) -> bool:
-    secret = websocket.app.state.settings.auth.jwt_secret
     raw = _current_token(websocket, token)
     if not raw:
         return False
     try:
-        decode_token(secret=secret, token=raw)
+        # touch=False: a socket streaming telemetry into a tab nobody is
+        # looking at must not keep the session alive. The Live view is
+        # exactly the page people leave open, so counting its WebSocket
+        # as activity would quietly disable the idle timeout for the
+        # common case. The frontend sends a real keepalive on user input.
+        session_svc.validate(
+            db=websocket.app.state.db,
+            settings=websocket.app.state.settings,
+            token=raw,
+            touch=False,
+        )
         return True
-    except AuthError:
+    except AuthError as e:
+        log.debug("ws auth rejected: %s", e)
         return False
 
 

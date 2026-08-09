@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .deps import Principal, require_admin, require_operator
@@ -39,8 +39,21 @@ async def get_config(
         "auth": {
             "operatorName": s.auth.operator_name,
             "sessionHours": s.auth.session_hours,
+            "idleTimeoutMinutes": s.auth.idle_timeout_minutes,
             "passwordConfigured": bool(s.auth.admin_password_hash),
             "jwtSecretConfigured": bool(s.auth.jwt_secret),
+            "requireTotp": s.auth.require_totp,
+            "passwordMinLength": s.auth.password_min_length,
+            "lockoutThreshold": s.auth.lockout_threshold,
+            "lockoutSeconds": s.auth.lockout_seconds,
+            "accountCount": request.app.state.db.user_count(),
+        },
+        "security": {
+            "publicExposure": s.security.public_exposure,
+            "requireHttps": s.https_required,
+            "headersEnabled": s.security.headers_enabled,
+            "hstsEnabled": s.security.hsts_enabled,
+            "ipAllowlistCount": len(s.security.ip_allowlist),
         },
         "slack": {
             "enabled": s.slack.enabled,
@@ -55,6 +68,18 @@ async def get_config(
             "alertOnCommand": s.slack.alert_on_command,
             "alertOnCommsLost": s.slack.alert_on_comms_lost,
             "alertOnLoadSourceChange": s.slack.alert_on_load_source_change,
+            "alertOnTransferToGenerator": s.slack.alert_on_transfer_to_generator,
+            "alertOnReturnToUtility": s.slack.alert_on_return_to_utility,
+            "alertOnLoadSourceUnknown": s.slack.alert_on_load_source_unknown,
+            "channelLoadSource": s.slack.channel_load_source,
+            "mentionOnTransferToGenerator": s.slack.mention_on_transfer_to_generator,
+            "mentionOnReturnToUtility": s.slack.mention_on_return_to_utility,
+            "loadSourceDebounceS": s.slack.load_source_debounce_s,
+            "alertOnLoginFailure": s.slack.alert_on_login_failure,
+            "alertOnAccountLockout": s.slack.alert_on_account_lockout,
+            "alertOnLoginSuccess": s.slack.alert_on_login_success,
+            "alertOnUserChange": s.slack.alert_on_user_change,
+            "channelSecurity": s.slack.channel_security,
         },
         "mqtt": {
             "enabled": s.mqtt.enabled,
@@ -90,6 +115,20 @@ class SlackUpdate(BaseModel):
     alert_on_command: bool | None = None
     alert_on_comms_lost: bool | None = None
     alert_on_load_source_change: bool | None = None
+    # Transfer-alert routing and per-direction gating.
+    alert_on_transfer_to_generator: bool | None = None
+    alert_on_return_to_utility: bool | None = None
+    alert_on_load_source_unknown: bool | None = None
+    channel_load_source: str | None = None
+    mention_on_transfer_to_generator: str | None = None
+    mention_on_return_to_utility: str | None = None
+    load_source_debounce_s: float | None = None
+    # Sign-in / account security alerts.
+    alert_on_login_failure: bool | None = None
+    alert_on_account_lockout: bool | None = None
+    alert_on_login_success: bool | None = None
+    alert_on_user_change: bool | None = None
+    channel_security: str | None = None
 
 
 class MqttUpdate(BaseModel):
@@ -121,22 +160,11 @@ class ConfigUpdate(BaseModel):
     ws_push_ms: int | None = None
 
 
-# Fields in this Slack update that, if present in the request, require
-# writing the live in-memory SlackConfig + restarting the notifier's
-# config snapshot. Used by the PUT handler below.
-_SLACK_HOTRELOAD_FIELDS = {
-    "enabled",
-    "bot_token",
-    "channel",
-    "site_label",
-    "alert_on_alarm",
-    "alert_on_warning",
-    "alert_on_alarm_cleared",
-    "alert_on_state_change",
-    "alert_on_command",
-    "alert_on_comms_lost",
-    "alert_on_load_source_change",
-}
+# Every field of SlackUpdate hot-reloads — the notifier reads its config
+# on each send, so a PUT takes effect on the next alert with no restart.
+# Derived from the model so a new option can't be added to SlackUpdate and
+# silently forgotten here.
+_SLACK_HOTRELOAD_FIELDS = set(SlackUpdate.model_fields)
 
 
 @router.put("/config")
@@ -262,6 +290,7 @@ async def update_config(
 @router.post("/slack/test")
 async def test_slack(
     request: Request,
+    kind: str = Query("generic", pattern="^(generic|load_source|security)$"),
     p: Principal = Depends(require_admin),
 ) -> dict:
     """Send a synchronous test message to Slack.
@@ -270,13 +299,19 @@ async def test_slack(
     recent PUT /api/config). Returns 200 with ``{ok, detail}`` even on
     failure so the UI can surface the Slack error verbatim instead of
     swallowing it as an HTTP error.
+
+    ``kind`` selects which alert *route* to exercise — the transfer alerts
+    and the security alerts can each be pointed at their own channel with
+    their own mention text, and an operator should be able to prove that
+    plumbing works before an outage is what tests it.
     """
     notifier = getattr(request.app.state, "slack", None)
     if notifier is None:
         raise HTTPException(503, "slack notifier not initialised")
-    ok, detail = await notifier.test()
+    ok, detail = await notifier.test(kind)
     request.app.state.db.write_audit(
-        p.operator, "slack.test", detail if not ok else "", "", "ok" if ok else "failed"
+        p.operator, "slack.test", f"kind={kind} {detail if not ok else ''}".strip(),
+        "", "ok" if ok else "failed",
     )
     return {"ok": ok, "detail": detail}
 

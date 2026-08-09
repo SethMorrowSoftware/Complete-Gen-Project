@@ -6,8 +6,11 @@ import type {
   MeBody,
   MqttUpdate,
   Reading,
+  Role,
+  SessionRow,
   SlackUpdate,
   StatusBody,
+  UserRow,
 } from "../types";
 
 const BASE = ""; // same-origin in production; Vite proxy in dev
@@ -71,14 +74,89 @@ async function request<T>(
   return data as T;
 }
 
+export interface LoginResponse {
+  ok: boolean;
+  operator: string;
+  role: Role;
+  mustChangePassword: boolean;
+  totpEnabled: boolean;
+  usedRecoveryCode: boolean;
+  recoveryCodesRemaining: number;
+}
+
 export const api = {
   me: () => request<MeBody>("/api/auth/me"),
-  login: (password: string) =>
-    request<{ ok: boolean; operator: string; role: string }>(
-      "/api/auth/login",
-      { method: "POST", body: JSON.stringify({ password }) }
-    ),
+  // `totp` is only sent once the server has asked for it (401 with
+  // code "totp_required"), so accounts without a second factor never
+  // see the field.
+  login: (username: string, password: string, totp?: string) =>
+    request<LoginResponse>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password, ...(totp ? { totp } : {}) }),
+    }),
   logout: () => request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
+
+  // ── Own account ──────────────────────────────────────────────────
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ ok: boolean; sessionsRevoked: boolean }>("/api/auth/password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  sessions: () => request<{ sessions: SessionRow[] }>("/api/auth/sessions"),
+  revokeOtherSessions: () =>
+    request<{ ok: boolean; revoked: number }>("/api/auth/sessions", { method: "DELETE" }),
+  totpEnroll: () =>
+    request<{ ok: boolean; secret: string; uri: string }>("/api/auth/totp/enroll", {
+      method: "POST",
+    }),
+  totpConfirm: (code: string) =>
+    request<{ ok: boolean; recoveryCodes: string[] }>("/api/auth/totp/confirm", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  totpDisable: (password: string) =>
+    request<{ ok: boolean }>("/api/auth/totp/disable", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }),
+
+  // ── User administration (admin role) ─────────────────────────────
+  users: () => request<{ users: UserRow[] }>("/api/users"),
+  createUser: (body: {
+    username: string;
+    password: string;
+    role: Role;
+    must_change_password?: boolean;
+  }) =>
+    request<{ ok: boolean; user: UserRow }>("/api/users", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateUser: (username: string, body: { role?: Role; disabled?: boolean }) =>
+    request<{ ok: boolean; user: UserRow }>(`/api/users/${encodeURIComponent(username)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  resetUserPassword: (username: string, new_password: string, must_change_password = true) =>
+    request<{ ok: boolean; user: UserRow }>(
+      `/api/users/${encodeURIComponent(username)}/password`,
+      { method: "POST", body: JSON.stringify({ new_password, must_change_password }) }
+    ),
+  unlockUser: (username: string) =>
+    request<{ ok: boolean; user: UserRow }>(
+      `/api/users/${encodeURIComponent(username)}/unlock`, { method: "POST" }
+    ),
+  revokeUserSessions: (username: string) =>
+    request<{ ok: boolean; revoked: number }>(
+      `/api/users/${encodeURIComponent(username)}/revoke-sessions`, { method: "POST" }
+    ),
+  disableUserTotp: (username: string) =>
+    request<{ ok: boolean; user: UserRow }>(
+      `/api/users/${encodeURIComponent(username)}/totp/disable`, { method: "POST" }
+    ),
+  deleteUser: (username: string) =>
+    request<{ ok: boolean }>(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" }),
+
   status: () => request<StatusBody>("/api/status"),
   health: () => request<{ ok: boolean; mock: boolean; version: string; commsState: string }>("/api/health"),
   events: (params: {
@@ -193,8 +271,13 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  testSlack: () =>
-    request<{ ok: boolean; detail: string }>("/api/slack/test", { method: "POST" }),
+  // `kind` picks which alert route to exercise — the transfer and
+  // security alerts can each have their own channel and mention, and an
+  // operator should be able to prove that plumbing before an outage does.
+  testSlack: (kind: "generic" | "load_source" | "security" = "generic") =>
+    request<{ ok: boolean; detail: string }>(
+      `/api/slack/test?kind=${kind}`, { method: "POST" }
+    ),
   testMqtt: () =>
     request<{ ok: boolean; detail: string }>("/api/mqtt/test", { method: "POST" }),
   registers: () =>

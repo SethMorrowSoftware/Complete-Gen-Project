@@ -1,9 +1,25 @@
 """Slack alerting via the Web API (chat.postMessage).
 
 Sends formatted notifications for alarms, alarm clears, state changes,
-operator commands, and Modbus comms transitions. Each event type is
-gated by a flag in SlackConfig so an operator can dial the chattiness
-to their taste (e.g. alarms only, no per-transition spam).
+operator commands, Modbus comms transitions, utility ↔ generator
+transfers, and sign-in / account activity. Each event type is gated by a
+flag in SlackConfig so an operator can dial the chattiness to their taste
+(e.g. alarms only, no per-transition spam).
+
+The transfer alerts (``alert_load_source_change``) get more machinery
+than the rest, because they're the ones people actually wait for:
+
+* per-direction gating — "the power went out" and "the power is back" go
+  to different audiences, and plenty of sites want only one of them;
+* a channel override, so an outage can page an on-call channel while
+  routine alarms stay somewhere quieter;
+* a mention prefix (``<!channel>``, ``<@U…>``, ``<!subteam^S…>``) placed
+  inside the message body, which is the only place Slack reads it from
+  when deciding whether to actually notify anyone;
+* a settle-time debounce — an ATS that hunts, or a utility browning out
+  repeatedly, otherwise produces a burst of contradictory pages during
+  the exact minutes an operator needs one clear signal. A flap that
+  lands back on the previously-announced source sends nothing at all.
 
 Design notes
 ------------
@@ -49,6 +65,9 @@ class _PendingMessage:
     # outage can't pile up retry tasks chewing through SEND_TIMEOUT_S
     # each, blocking newer (more urgent) alerts behind them.
     enqueued_at: float = 0.0
+    # Per-message channel override (transfer alerts and security alerts
+    # can be routed to their own channels). Empty → cfg.channel.
+    channel: str = ""
 
 
 class SlackNotifier:
@@ -82,6 +101,15 @@ class SlackNotifier:
         # Per-(code, kind) last-sent timestamps. Read+write only from
         # the event loop (alert_* methods are async); no lock needed.
         self._recent_sends: dict[tuple[str, str], float] = {}
+        # ── Load-source debounce state (see alert_load_source_change) ──
+        # The in-flight delayed alert, the source it will announce, and
+        # the last source we actually told Slack about. The last one is
+        # what makes a flap that returns to the announced state collapse
+        # into no message at all.
+        self._ls_pending: asyncio.Task | None = None
+        self._ls_pending_to: str = ""
+        self._ls_pending_from: str = ""
+        self._ls_announced: str | None = None
 
     # ---- lifecycle ----------------------------------------------------
     async def start(self) -> None:
@@ -98,6 +126,13 @@ class SlackNotifier:
 
     async def stop(self) -> None:
         self._running = False
+        if self._ls_pending is not None:
+            self._ls_pending.cancel()
+            try:
+                await self._ls_pending
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._ls_pending = None
         if self._worker_task is not None:
             self._worker_task.cancel()
             try:
@@ -196,32 +231,101 @@ class SlackNotifier:
     async def alert_load_source_change(self, old: str, new: str, ts: float) -> None:
         """Notify on a utility ↔ generator load-source transition.
 
-        Suppresses the boot-time 'unknown → utility' (just initial
-        firming, not an operational event). 'utility → generator' is
-        the high-signal alert: the load just moved to backup power.
-        'generator → utility' is the recovery announcement.
+        This is the alert operators actually wait for: the load just moved
+        to backup power, or the utility is back. It is driven by the
+        ATS-Pi's physical switch position when that companion is
+        authoritative and by the H-100 electrical inference otherwise, so
+        it fires with or without the companion.
+
+        Gating, in order:
+          1. ``alert_on_load_source_change`` — master switch.
+          2. The boot-time ``unknown → utility`` firming is suppressed;
+             it's an artifact of starting up, not a transfer.
+          3. Per-direction flags, so a site can page on the outage and
+             stay quiet on the restore (or the reverse).
+          4. ``load_source_debounce_s`` — hold the message and only send
+             it if the load source is still there when the timer expires.
         """
         if not self.cfg.alert_on_load_source_change:
             return
         if old == "unknown" and new == "utility":
             return
+        if new == "generator" and not self.cfg.alert_on_transfer_to_generator:
+            return
+        if new == "utility" and not self.cfg.alert_on_return_to_utility:
+            return
+        if new not in ("generator", "utility") and not self.cfg.alert_on_load_source_unknown:
+            return
+
+        debounce = max(0.0, float(self.cfg.load_source_debounce_s or 0.0))
+        if debounce <= 0:
+            self._ls_announced = new
+            await self._send_load_source(old, new)
+            return
+
+        # Debounced path. A newer transition supersedes whatever is
+        # waiting: cancel the pending task and re-arm with the new
+        # destination, keeping `from` anchored to the last state Slack was
+        # told about, so the message reads truthfully after a flap.
+        if self._ls_announced is None:
+            # Nothing announced yet — as far as Slack is concerned the
+            # load has been on `old` all along. Recording that here is
+            # what lets a flap back to `old` cancel the alert entirely
+            # instead of posting "Load on UTILITY (was utility)".
+            self._ls_announced = old
+        if self._ls_pending is not None and not self._ls_pending.done():
+            self._ls_pending.cancel()
+        self._ls_pending_from = self._ls_announced
+        self._ls_pending_to = new
+        self._ls_pending = asyncio.create_task(
+            self._load_source_after(debounce), name="slack-load-source-debounce"
+        )
+
+    async def _load_source_after(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        new = self._ls_pending_to
+        old = self._ls_pending_from
+        self._ls_pending = None
+        if not self._running:
+            return
+        if self._ls_announced is not None and new == self._ls_announced:
+            # The source flapped away and came back inside the window —
+            # from Slack's point of view nothing changed, so say nothing.
+            log.info(
+                "Slack: load source settled back on %s within the debounce window "
+                "— no alert sent", new,
+            )
+            return
+        self._ls_announced = new
+        try:
+            await self._send_load_source(old, new)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Slack: debounced load-source send failed: %s", e)
+
+    async def _send_load_source(self, old: str, new: str) -> None:
+        old = old or "unknown"
         if new == "generator":
-            emoji = ":zap:"
-            sev = "warn"
+            emoji, sev = ":zap:", "warn"
             title = f"{emoji} Load on GENERATOR (was {old})"
+            mention = self.cfg.mention_on_transfer_to_generator
         elif new == "utility":
-            emoji = ":electric_plug:"
-            sev = "ok"
+            emoji, sev = ":electric_plug:", "ok"
             title = f"{emoji} Load on UTILITY (was {old})"
+            mention = self.cfg.mention_on_return_to_utility
         else:
-            emoji = ":grey_question:"
-            sev = "warn"
+            emoji, sev = ":grey_question:", "warn"
             title = f"{emoji} Load source UNKNOWN (was {old})"
+            mention = ""
         await self._enqueue(
             severity=sev,
             title=title,
             fields=[("Site", self._site())],
             fallback=f"Load source {old} → {new} @ {self._site()}",
+            channel=self.cfg.channel_load_source,
+            mention=mention,
         )
 
     async def alert_command(self, verb: str, operator: str, result: str, ts: float) -> None:
@@ -260,24 +364,122 @@ class SlackNotifier:
             fallback=f"Modbus comms {old} → {new} ({success_pct:.0f}%) @ {self._site()}",
         )
 
+    # ---- security events ----------------------------------------------
+    # An internet-exposed login deserves the same treatment as an alarm
+    # bit: the operator finds out from Slack, not from reading the audit
+    # table after something has already gone wrong.
+
+    async def alert_login_failure(
+        self, *, username: str, ip: str, reason: str, attempts: int, ts: float = 0.0
+    ) -> None:
+        if not self.cfg.alert_on_login_failure:
+            return
+        # Dedupe per account per window: a spray attack must not be able
+        # to push real alarms out of the 200-slot queue. The lockout alert
+        # below is the one that carries the "this is happening" signal.
+        if self._dedupe_skip(f"login:{username or '?'}", "failure"):
+            return
+        await self._enqueue(
+            severity="warn",
+            title=f":no_entry: Failed sign-in — `{username or '(no username)'}`",
+            fields=[
+                ("Source IP", ip or "unknown"),
+                ("Reason", reason or "invalid credentials"),
+                ("Failed attempts", str(attempts)),
+                ("Site", self._site()),
+            ],
+            fallback=f"Failed sign-in for {username or '(none)'} from {ip} @ {self._site()}",
+            channel=self.cfg.channel_security,
+        )
+
+    async def alert_account_lockout(
+        self, *, username: str, ip: str, seconds: float, ts: float = 0.0
+    ) -> None:
+        if not self.cfg.alert_on_account_lockout:
+            return
+        mins = max(1, int(round(seconds / 60.0)))
+        await self._enqueue(
+            severity="alarm",
+            title=f":lock: Account locked — `{username}`",
+            fields=[
+                ("Locked for", f"{mins} min"),
+                ("Source IP", ip or "unknown"),
+                ("Site", self._site()),
+            ],
+            fallback=f"Account {username} locked for {mins} min after repeated failures @ {self._site()}",
+            channel=self.cfg.channel_security,
+        )
+
+    async def alert_login_success(
+        self, *, username: str, ip: str, method: str = "password", ts: float = 0.0
+    ) -> None:
+        if not self.cfg.alert_on_login_success:
+            return
+        await self._enqueue(
+            severity="info",
+            title=f":key: Sign-in — `{username}`",
+            fields=[("Source IP", ip or "unknown"), ("Method", method), ("Site", self._site())],
+            fallback=f"{username} signed in from {ip} @ {self._site()}",
+            channel=self.cfg.channel_security,
+        )
+
+    async def alert_user_change(
+        self, *, action: str, target: str, actor: str, detail: str = "", ts: float = 0.0
+    ) -> None:
+        """Account created / deleted / role changed / password reset / 2FA changed."""
+        if not self.cfg.alert_on_user_change:
+            return
+        fields = [("Account", target), ("By", actor or "system"), ("Site", self._site())]
+        if detail:
+            fields.insert(2, ("Detail", detail))
+        await self._enqueue(
+            severity="warn",
+            title=f":bust_in_silhouette: Account {action} — `{target}`",
+            fields=fields,
+            fallback=f"Account {action}: {target} by {actor or 'system'} @ {self._site()}",
+            channel=self.cfg.channel_security,
+        )
+
     # ---- test ---------------------------------------------------------
-    async def test(self) -> tuple[bool, str]:
-        """Send a synchronous test message. Returns (ok, error_or_'ok')."""
+    async def test(self, kind: str = "generic") -> tuple[bool, str]:
+        """Send a synchronous test message. Returns (ok, error_or_'ok').
+
+        ``kind`` picks which alert *route* to exercise, so an operator can
+        confirm the channel override and the mention text actually work
+        before an outage is the thing testing them:
+
+          generic      — the plain channel
+          load_source  — channel_load_source + mention_on_transfer_to_generator
+          security     — channel_security
+        """
         if not self.cfg.bot_token:
             return False, "bot_token not set"
-        if not self.cfg.channel:
+        channel, mention, label = self._route_for_test(kind)
+        if not channel:
             return False, "channel not set"
+        when = time.strftime("%Y-%m-%d %H:%M:%S %Z").strip() or "(unknown)"
+        title = f":test_tube: Castle Generator Monitor — {label} test"
+        if mention:
+            title = f"{mention} {title}"
         blocks = _build_blocks(
             severity="info",
-            title=":test_tube: Castle Generator Monitor — test message",
-            fields=[
-                ("Site", self._site()),
-                ("When", time.strftime("%Y-%m-%d %H:%M:%S %Z").strip() or "(unknown)"),
-            ],
+            title=title,
+            fields=[("Site", self._site()), ("Route", label), ("When", when)],
         )
-        fallback = f"Castle Generator Monitor test message from {self._site()}"
-        ok, err = await self._send(blocks, fallback, timeout=self.SEND_TIMEOUT_S)
+        fallback = f"Castle Generator Monitor {label} test message from {self._site()}"
+        ok, err = await self._send(blocks, fallback, timeout=self.SEND_TIMEOUT_S, channel=channel)
         return ok, "ok" if ok else err
+
+    def _route_for_test(self, kind: str) -> tuple[str, str, str]:
+        if kind == "load_source":
+            return (
+                self.cfg.channel_load_source or self.cfg.channel,
+                self.cfg.mention_on_transfer_to_generator,
+                "transfer alert",
+            )
+        if kind == "security":
+            return (self.cfg.channel_security or self.cfg.channel, "", "security alert")
+        return (self.cfg.channel, "", "general")
 
     # ---- internals ----------------------------------------------------
     def _site(self) -> str:
@@ -290,11 +492,22 @@ class SlackNotifier:
         title: str,
         fields: list[tuple[str, str]],
         fallback: str,
+        channel: str = "",
+        mention: str = "",
     ) -> None:
         if not self.is_enabled():
             return
+        if mention:
+            # The mention has to sit inside the message body for Slack to
+            # actually notify anyone — a mention in metadata is just text.
+            # It goes in both the block title and the notification-preview
+            # fallback so the push notification names the ping too.
+            title = f"{mention} {title}"
+            fallback = f"{mention} {fallback}"
         blocks = _build_blocks(severity=severity, title=title, fields=fields)
-        msg = _PendingMessage(blocks=blocks, fallback=fallback, enqueued_at=time.time())
+        msg = _PendingMessage(
+            blocks=blocks, fallback=fallback, enqueued_at=time.time(), channel=channel,
+        )
         try:
             self._queue.put_nowait(msg)
         except asyncio.QueueFull:
@@ -323,7 +536,10 @@ class SlackNotifier:
             except asyncio.CancelledError:
                 return
             try:
-                ok, err = await self._send(msg.blocks, msg.fallback, timeout=self.SEND_TIMEOUT_S)
+                ok, err = await self._send(
+                    msg.blocks, msg.fallback,
+                    timeout=self.SEND_TIMEOUT_S, channel=msg.channel,
+                )
                 if ok:
                     continue
                 # Retry on transport errors only — slack_error responses
@@ -380,9 +596,13 @@ class SlackNotifier:
         fallback: str,
         *,
         timeout: float,
+        channel: str = "",
     ) -> tuple[bool, str]:
         token = self.cfg.bot_token
-        channel = self.cfg.channel
+        # Per-message override (transfer / security routing) falls back to
+        # the main channel, so clearing an override can't silently drop
+        # alerts on the floor.
+        channel = channel or self.cfg.channel
         if not token or not channel:
             return False, "not_configured"
         payload = {

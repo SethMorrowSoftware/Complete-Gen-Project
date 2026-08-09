@@ -497,7 +497,7 @@ async def client(app_env):
 
 
 async def _login(c: httpx.AsyncClient) -> None:
-    r = await c.post("/api/auth/login", json={"password": "test"})
+    r = await c.post("/api/auth/login", json={"username": "admin", "password": "test"})
     assert r.status_code == 200, r.text
 
 

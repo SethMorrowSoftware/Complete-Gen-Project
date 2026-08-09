@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..db import COLUMN_MAP
-from .deps import Principal, require_operator
+from .deps import Principal, require_viewer
 
 router = APIRouter(prefix="/api", tags=["telemetry"])
 
@@ -32,7 +32,7 @@ async def telemetry(
     from_ts: float | None = Query(None, alias="from"),
     to_ts: float | None = Query(None, alias="to"),
     max_points: int = Query(2000, ge=10, le=10_000),
-    p: Principal = Depends(require_operator),
+    p: Principal = Depends(require_viewer),
 ) -> dict:
     column = METRIC_TO_COLUMN.get(metric)
     if column is None:
@@ -64,5 +64,5 @@ async def _read(request: Request, column: str, from_ts: float, to_ts: float, max
 
 
 @router.get("/telemetry/columns")
-async def columns(p: Principal = Depends(require_operator)) -> dict:
+async def columns(p: Principal = Depends(require_viewer)) -> dict:
     return {"metric_to_column": METRIC_TO_COLUMN, "all_columns": COLUMN_MAP}

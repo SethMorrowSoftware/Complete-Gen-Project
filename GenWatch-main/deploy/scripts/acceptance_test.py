@@ -6,9 +6,9 @@ deployment behaves correctly and that its SAFETY guards hold *before* you
 trust the install. It needs no third-party packages — only the Python 3
 standard library — so it runs with the system `python3`.
 
-    python3 acceptance_test.py --password '<admin password>'
+    python3 acceptance_test.py --username alice --password '<password>'
     # safer (keeps the password out of shell history / `ps`):
-    GENWATCH_TEST_PASSWORD='<pw>' python3 acceptance_test.py
+    GENWATCH_TEST_USERNAME=alice GENWATCH_TEST_PASSWORD='<pw>' python3 acceptance_test.py
     # or just run it and you'll be prompted with no echo:
     python3 acceptance_test.py
 
@@ -140,6 +140,15 @@ def _read_json(resp) -> dict:
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
+def resolve_username(args) -> str:
+    if args.username:
+        return args.username
+    env = os.environ.get("GENWATCH_TEST_USERNAME")
+    if env:
+        return env
+    return input("GenWatch admin username: ").strip()
+
+
 def resolve_password(args) -> str:
     if args.password:
         return args.password
@@ -147,7 +156,7 @@ def resolve_password(args) -> str:
     if env:
         return env
     import getpass
-    return getpass.getpass("GenWatch admin password: ")
+    return getpass.getpass("GenWatch password: ")
 
 
 def _rejected(code: int | None) -> bool:
@@ -227,25 +236,52 @@ def section_auth(rec, anon, auth, args) -> bool:
         rec.add(PASS if code == 401 else FAIL, f"unauthenticated POST {path} refused",
                 f"-> {code} (want 401)")
 
-    # Wrong password rejected. A 429 here means the login rate-limiter
-    # engaged — itself a working safety control — so accept either.
-    code, _ = anon("POST", "/api/auth/login", {"password": "wrong-" + os.urandom(4).hex()})
+    user = resolve_username(args)
+
+    # Wrong password rejected. A 429 here means either the login
+    # rate-limiter or the per-account lockout engaged — both are working
+    # safety controls — so accept either.
+    #
+    # NOTE this deliberately guesses against a NON-EXISTENT account, not
+    # the real one: a wrong-password attempt against `user` would count
+    # toward its lockout and could lock a commissioning engineer out of
+    # the console mid-acceptance.
+    probe_user = "acctest-" + os.urandom(3).hex()
+    code, body = anon("POST", "/api/auth/login",
+                      {"username": probe_user, "password": "wrong-" + os.urandom(4).hex()})
     if code == 401:
-        rec.add(PASS, "wrong password refused", "-> 401")
+        detail = _detail_code(body)
+        if detail == "invalid_credentials":
+            rec.add(PASS, "wrong password refused", "-> 401 invalid_credentials")
+        else:
+            # A response that distinguishes "no such user" from "wrong
+            # password" hands an attacker a list of valid accounts.
+            rec.add(FAIL, "wrong password refused",
+                    f"-> 401 but code={detail!r} (want the generic invalid_credentials)")
     elif code == 429:
         rec.add(WARN, "wrong password refused", "-> 429 (login rate-limiter engaged)")
     else:
         rec.add(FAIL, "wrong password refused", f"-> {code} (want 401)")
 
     pw = resolve_password(args)
-    code, _ = auth("POST", "/api/auth/login", {"password": pw})
+    code, login_body = auth("POST", "/api/auth/login", {"username": user, "password": pw})
+    if code == 401 and _detail_code(login_body) == "totp_required":
+        totp = os.environ.get("GENWATCH_TEST_TOTP") or input("Authenticator code: ").strip()
+        code, login_body = auth("POST", "/api/auth/login",
+                                {"username": user, "password": pw, "totp": totp})
     if code == 200:
         rec.add(PASS, "admin login", "session established")
     elif code == 429:
         rec.add(FAIL, "admin login", "-> 429 rate-limited; wait ~5 min, avoid running in a loop")
         return False
     elif code == 401:
-        rec.add(FAIL, "admin login", "-> 401 wrong password (pass --password / $GENWATCH_TEST_PASSWORD)")
+        rec.add(FAIL, "admin login",
+                "-> 401 wrong username/password "
+                "(pass --username/--password or $GENWATCH_TEST_USERNAME/$GENWATCH_TEST_PASSWORD)")
+        return False
+    elif code == 403 and _detail_code(login_body) == "password_change_required":
+        rec.add(FAIL, "admin login",
+                "-> this account still holds a temporary password; set a real one first")
         return False
     else:
         rec.add(FAIL, "admin login", f"-> {code}")
@@ -436,8 +472,10 @@ def main() -> int:
                "instance. See the module docstring for the safety model.",
     )
     p.add_argument("--base-url", default=os.environ.get("GENWATCH_BASE_URL", "http://127.0.0.1:8000"))
+    p.add_argument("--username", default=None,
+                   help="operator username (prefer $GENWATCH_TEST_USERNAME or the prompt)")
     p.add_argument("--password", default=None,
-                   help="admin password (prefer $GENWATCH_TEST_PASSWORD or the prompt)")
+                   help="password (prefer $GENWATCH_TEST_PASSWORD or the prompt)")
     p.add_argument("--expected-unit-id", type=int, default=23,
                    help="ATS-Pi unit id to expect (default 23)")
     p.add_argument("--expect-mock", type=_optbool, default=None,

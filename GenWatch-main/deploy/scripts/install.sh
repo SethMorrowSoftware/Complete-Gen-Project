@@ -383,22 +383,29 @@ udevadm control --reload-rules
 udevadm trigger --subsystem-match=tty || true
 
 # ─── 7. config.yaml ───────────────────────────────────────────────────────
-NEEDS_PASSWORD=0
 if [[ ! -f "$ETC_DIR/config.yaml" ]]; then
   log "Provisioning $ETC_DIR/config.yaml with a random jwt_secret"
   install -m 0640 -o "$USER" -g "$USER" "$REPO_ROOT/deploy/config.yaml.example" "$ETC_DIR/config.yaml"
   SECRET=$("$APP_DIR/venv/bin/python" -c 'import secrets;print(secrets.token_hex(32))')
   sed -i "s|^  jwt_secret:.*$|  jwt_secret: \"$SECRET\"|" "$ETC_DIR/config.yaml"
-  NEEDS_PASSWORD=1
 else
   log "Config already exists at $ETC_DIR/config.yaml — not touching"
   # Verify it has a usable jwt_secret; warn if not
   if grep -q '^  jwt_secret: "REPLACE_ME"' "$ETC_DIR/config.yaml"; then
     warn "jwt_secret is still REPLACE_ME in $ETC_DIR/config.yaml"
   fi
-  if grep -q '^  admin_password_hash: "REPLACE_ME"' "$ETC_DIR/config.yaml"; then
-    NEEDS_PASSWORD=1
-  fi
+fi
+
+# Operators sign in with their own accounts, which live in the service
+# database rather than in config.yaml. Ask the database (not the config
+# file) whether anyone can actually log in — a fresh install has nobody,
+# and an upgrade from the single-shared-password era has its hash migrated
+# into a real admin account on first boot.
+NEEDS_ACCOUNT=0
+if ! GENWATCH_CONFIG_PATH="$ETC_DIR/config.yaml" \
+     sudo -u "$USER" "$APP_DIR/venv/bin/python" -m genwatch userlist 2>/dev/null \
+     | grep -qE '^\S+\s+admin\s+active'; then
+  NEEDS_ACCOUNT=1
 fi
 
 # ─── 8. systemd unit ──────────────────────────────────────────────────────
@@ -468,21 +475,28 @@ sudo -u "$USER" \
 set -e
 
 # ─── 10. start service ────────────────────────────────────────────────────
-if (( NEEDS_PASSWORD )); then
+if (( NEEDS_ACCOUNT )); then
   echo
   echo "============================================================"
-  echo "  ⚠  ADMIN PASSWORD NOT SET"
+  echo "  ⚠  NO OPERATOR ACCOUNTS YET"
   echo
-  echo "  Generate a bcrypt hash and paste into the config:"
+  echo "  Create the first admin account (prompts twice, no echo):"
   echo
-  echo "    sudo genwatch hash                  # prompts for the password (no echo)"
-  echo "    sudo nano $ETC_DIR/config.yaml      # paste into admin_password_hash"
-  echo "    sudo systemctl restart genwatch"
+  echo "    sudo -u $USER genwatch useradd <username> --role admin"
+  echo "    sudo systemctl start genwatch"
   echo
-  echo "  The service will not start until a password is configured."
+  echo "  Then add per-operator accounts, either with"
+  echo "  'genwatch useradd <name> --role operator' or from Settings -> Users."
+  echo "  Roles: viewer (read-only), operator (+ control), admin (+ config)."
+  echo
+  echo "  Exposing this console to the internet? Work through"
+  echo "  docs/SECURITY.md first — two-factor, TLS enforcement and the"
+  echo "  security.public_exposure boot gate."
+  echo
+  echo "  The service will not start until an account exists."
   echo "============================================================"
   echo
-  log "Skipping systemctl start — set admin_password_hash first."
+  log "Skipping systemctl start — create an admin account first."
 else
   if systemctl is-active --quiet genwatch.service; then
     log "Restarting genwatch.service"

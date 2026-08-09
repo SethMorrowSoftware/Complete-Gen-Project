@@ -111,12 +111,59 @@ class RetentionConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    # Single-password mode. Hash with passlib bcrypt and paste here.
-    # Generate: python -m genwatch.tools hash <password>
+    # ── Accounts ──────────────────────────────────────────────────────
+    # Logins are per-user: named accounts with their own passwords live in
+    # the database (`users` table), managed via Settings → Users in the UI
+    # or the `genwatch useradd / userpasswd / userlist` CLI.
+    #
+    # admin_password_hash is the LEGACY single shared password. It is used
+    # for exactly one thing now: seeding the first admin account on an
+    # upgrade, so an existing deployment doesn't lock itself out. Once any
+    # account exists it is never consulted again and can be cleared.
+    # Generate: sudo -u genwatch genwatch hash
     admin_password_hash: str = ""
+    # Username given to that seeded account.
+    bootstrap_username: str = "admin"
+    # Display name for the legacy single-operator identity. Kept for
+    # backward compatibility with old audit rows; new sessions are
+    # attributed to the account's username.
     operator_name: str = "operator"
     jwt_secret: str = ""  # filled at install-time
     session_hours: int = 12
+
+    # ── Login hardening ───────────────────────────────────────────────
+    # Sessions also expire after this much inactivity, independent of
+    # session_hours. An operator who leaves the console open on a shop
+    # laptop shouldn't hand over a live session for the rest of the day.
+    # 0 disables the idle timeout (absolute expiry still applies).
+    idle_timeout_minutes: int = 60
+
+    # Failed sign-ins before the account itself locks (on top of the
+    # per-IP rate limiter, which a botnet can sidestep by rotating IPs).
+    lockout_threshold: int = 5
+    # First lockout duration in seconds; doubles on each further lockout
+    # up to lockout_max_seconds. 0 disables account lockout entirely
+    # (NOT recommended when the console is reachable from the internet).
+    lockout_seconds: int = 900
+    lockout_max_seconds: int = 3600
+
+    # Per-IP login token bucket: `login_rate_burst` attempts, then one
+    # more every `login_rate_refill_seconds`.
+    login_rate_burst: int = 5
+    login_rate_refill_seconds: int = 180
+
+    # Minimum length for new passwords. The policy also rejects common
+    # passwords, keyboard runs, and passwords containing the username;
+    # see services/auth.validate_password_strength. Passwords already on
+    # disk are never re-validated — only new ones.
+    password_min_length: int = 12
+
+    # Require a TOTP second factor from every account. Enroll accounts
+    # FIRST (Settings → Account, or `genwatch usertotp <name>`); accounts
+    # that haven't enrolled are refused rather than silently exempted.
+    require_totp: bool = False
+    # Issuer name shown in the authenticator app.
+    totp_issuer: str = "Castle Generator Monitor"
 
     # ── Session-cookie hardening ──────────────────────────────────────
     # cookie_secure controls the `Secure` attribute on the JWT cookie:
@@ -163,6 +210,78 @@ class AuthConfig(BaseModel):
                     "(browser refuses to store SameSite=None cookies without Secure)"
                 )
         return v
+
+
+# Default Content-Security-Policy for the operator console.
+#
+# `{ws_self}` is substituted at request time with ws://HOST and wss://HOST
+# for the request's own Host header, so the live WebSocket works without
+# opening connect-src to every host on the internet. If you override
+# `security.csp`, include the placeholder (or your own explicit ws origin)
+# or the Live view will stop updating.
+#
+# The two fonts.* origins are there because index.html pulls Geist and
+# JetBrains Mono from Google Fonts. Self-host them and you can drop both.
+DEFAULT_CSP = (
+    "default-src 'self'; "
+    "base-uri 'none'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "form-action 'self'; "
+    "img-src 'self' data:; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' data: https://fonts.gstatic.com; "
+    "connect-src 'self' {ws_self}"
+)
+
+
+class SecurityConfig(BaseModel):
+    """HTTP-layer hardening. Matters most when the console is exposed.
+
+    ``public_exposure`` is the one switch to flip when this server becomes
+    reachable from the open internet. It doesn't change behaviour by
+    itself so much as it turns advisory checks into refusals: the service
+    will not boot with a configuration that is fine on a LAN but reckless
+    on a public address (see main.py::_check_public_exposure).
+    """
+
+    # Tell GenWatch it is internet-facing. Turns the deployment checklist
+    # from warnings into boot-time errors, and defaults require_https on.
+    public_exposure: bool = False
+
+    # Emit the hardening response headers (CSP, nosniff, frame-ancestors,
+    # Referrer-Policy, Permissions-Policy, COOP/CORP, no-store on /api).
+    # Only turn this off if you are debugging a header conflict with a
+    # reverse proxy that sets its own.
+    headers_enabled: bool = True
+
+    # HSTS is only ever sent on requests we already saw as HTTPS, so it
+    # cannot lock out a plain-HTTP LAN deployment.
+    hsts_enabled: bool = True
+    hsts_max_age: int = 31536000  # 1 year
+    # Leave off unless every hostname under this domain is HTTPS — this
+    # header is remembered by browsers for a year and is easy to regret.
+    hsts_include_subdomains: bool = False
+
+    # Content-Security-Policy string; "" disables the header.
+    csp: str = DEFAULT_CSP
+
+    # Refuse plain-HTTP requests. `None` means "follow public_exposure":
+    # enforced when the console is declared internet-facing, off on a LAN.
+    # The scheme is read from the request, including X-Forwarded-Proto
+    # from a trusted proxy (see GENWATCH_TRUSTED_PROXIES).
+    require_https: bool | None = None
+
+    # Optional network allowlist, as IPs or CIDRs ("203.0.113.4",
+    # "198.51.100.0/24", "2001:db8::/32"). Empty = allow all. Loopback is
+    # always allowed so a local admin can never be locked out.
+    #
+    # CAVEAT: behind a reverse proxy this only works if the proxy sets
+    # X-Forwarded-For AND its address is in GENWATCH_TRUSTED_PROXIES —
+    # otherwise every request appears to come from the proxy and the
+    # allowlist either passes everything or nothing.
+    ip_allowlist: list[str] = []
 
 
 class AtsConfig(BaseModel):
@@ -231,7 +350,63 @@ class SlackConfig(BaseModel):
     # Utility ↔ generator load-source transitions. Defaults on because
     # an outage / restored-power notification is high-signal — operators
     # want to know immediately, even if engine state change alerts are off.
+    #
+    # This is the master switch for transfer alerts; the two direction
+    # flags below sub-gate it, so turning this off silences both.
     alert_on_load_source_change: bool = True
+
+    # ── Transfer alerts: per-direction control ────────────────────────
+    # "The power just went out" and "the power is back" are different
+    # messages to different people. Sites that only want the outage page
+    # turn the retransfer off; sites running scheduled exercises often do
+    # the opposite.
+    alert_on_transfer_to_generator: bool = True   # utility → generator
+    alert_on_return_to_utility: bool = True       # generator → utility
+    # A sustained loss of both the ATS-Pi position and the H-100
+    # electrical inference. Rare, and usually means an instrumentation
+    # problem rather than a transfer — off by default so it can't drown
+    # the two alerts above.
+    alert_on_load_source_unknown: bool = False
+
+    # Route transfer alerts to their own channel (e.g. an on-call channel
+    # that pages, while routine alarms go to a quieter one). Empty = use
+    # `channel`.
+    channel_load_source: str = ""
+
+    # Text prepended to the transfer message so Slack actually notifies
+    # someone. Slack mention syntax, NOT a plain @name:
+    #   "<!channel>"            — everyone in the channel
+    #   "<!here>"               — everyone currently online
+    #   "<@U024BE7LH>"          — one person, by member ID
+    #   "<!subteam^S012ABC3DE>" — a user group
+    # Empty = no mention (message still posts).
+    mention_on_transfer_to_generator: str = ""
+    mention_on_return_to_utility: str = ""
+
+    # Hold a transfer alert for this many seconds and only send it if the
+    # load source is still there when the timer fires. An ATS that hunts
+    # (or a utility that browns out repeatedly) can otherwise produce a
+    # burst of contradictory pages during the exact minutes an operator
+    # most needs a clear signal. 0 = send immediately.
+    #
+    # A transition that lands back on the previously-announced source
+    # within the window cancels the alert entirely — nothing changed, so
+    # nothing is worth paging about.
+    load_source_debounce_s: float = 0.0
+
+    # ── Security alerts ───────────────────────────────────────────────
+    # Sign-in activity on an internet-exposed console. Failures are
+    # deduplicated per account per minute so a brute-force attempt can't
+    # flood the channel (the lockout alert is the one that matters).
+    alert_on_login_failure: bool = True
+    alert_on_account_lockout: bool = True
+    alert_on_login_success: bool = False   # chatty at most sites
+    # Account created / deleted / role changed / password reset / 2FA
+    # changed — the audit trail an operator wants to see in real time.
+    alert_on_user_change: bool = True
+    # Route security alerts somewhere other than `channel` (an admin-only
+    # channel, typically — these messages name accounts and source IPs).
+    channel_security: str = ""
 
 
 class MqttConfig(BaseModel):
@@ -342,6 +517,7 @@ class Settings(BaseSettings):
     modbus: ModbusConfig = Field(default_factory=ModbusConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     mqtt: MqttConfig = Field(default_factory=MqttConfig)
     ats: AtsConfig = Field(default_factory=AtsConfig)
@@ -355,6 +531,18 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return Path(self.data_dir) / "db.sqlite"
+
+    @property
+    def https_required(self) -> bool:
+        """Whether plain-HTTP requests are refused.
+
+        Explicit ``security.require_https`` wins; otherwise it follows
+        ``security.public_exposure`` so declaring the console
+        internet-facing turns on TLS enforcement without a second knob.
+        """
+        if self.security.require_https is not None:
+            return self.security.require_https
+        return self.security.public_exposure
 
     @property
     def register_file_path(self) -> Path:
