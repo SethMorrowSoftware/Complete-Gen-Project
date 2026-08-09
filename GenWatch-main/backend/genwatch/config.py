@@ -394,6 +394,21 @@ class SlackConfig(BaseModel):
     # nothing is worth paging about.
     load_source_debounce_s: float = 0.0
 
+    # ── Fuel alerts ───────────────────────────────────────────────────
+    # Gated by `fuel.enabled` above all — these flags only decide which of
+    # the fuel events reach Slack once monitoring is on. Thresholds,
+    # hysteresis and the reminder interval live in the `fuel` section,
+    # because they describe the condition rather than the notification.
+    alert_on_fuel_warning: bool = True    # crossed the warn threshold
+    alert_on_fuel_critical: bool = True   # crossed the critical threshold
+    alert_on_fuel_reminder: bool = True   # still low N hours later
+    alert_on_fuel_recovered: bool = True  # refuelled
+    alert_on_fuel_drop: bool = True       # abnormal drop (leak / theft)
+    channel_fuel: str = ""                # blank = use `channel`
+    # Only on the critical tier and the drop alert — a "order fuel this
+    # week" warning does not deserve an @channel at 2 a.m.
+    mention_on_fuel_critical: str = ""
+
     # ── Security alerts ───────────────────────────────────────────────
     # Sign-in activity on an internet-exposed console. Failures are
     # deduplicated per account per minute so a brute-force attempt can't
@@ -407,6 +422,60 @@ class SlackConfig(BaseModel):
     # Route security alerts somewhere other than `channel` (an admin-only
     # channel, typically — these messages name accounts and source IPs).
     channel_security: str = ""
+
+
+class FuelConfig(BaseModel):
+    """Low-fuel warnings and abnormal-drop detection.
+
+    Disabled by default, deliberately. ``fuel_level_pct`` (0x0092) is not
+    verified on every H-100 revision — its neighbour ``coolant_level``
+    carries a standing note that the panel's engineering unit may not be a
+    true percent, and unconfigured channels on this controller read
+    0xFFFF. Confirm the reading against the panel with ``genwatch panel``
+    before turning this on; a false "FUEL EMPTY" page is how a site learns
+    to ignore its alerts.
+
+    Automatically inert at gaseous-fuel sites (``site.fuel_type`` in the
+    register map), which have no local tank to run out of.
+
+    See services/fuel.py for why this doesn't ride on the existing
+    ``warn_range`` / ``alarm_range`` numeric-alarm mechanism — the short
+    version is that those only evaluate while the engine is *running*,
+    and low fuel matters most while it is stopped.
+    """
+
+    enabled: bool = False
+
+    # Two tiers, because they mean different things to whoever gets the
+    # message: "order fuel this week" versus "you have hours of runtime".
+    warn_pct: float = 25.0
+    critical_pct: float = 10.0
+
+    # A tank on a running genset sloshes. Rising past a threshold has to
+    # clear it by this much before we'll call the situation improved, so a
+    # sender oscillating on the line warns once instead of flapping.
+    hysteresis_pct: float = 3.0
+
+    # Repeat while the tank is still low. Low fuel is a condition somebody
+    # has to act on, not a one-shot event — silence after the first
+    # message reads as "handled". 0 disables the reminder.
+    renotify_hours: float = 12.0
+
+    # Readings outside this band are treated as a SENSOR FAULT and
+    # suppress alerting, rather than being read as an empty tank.
+    min_valid_pct: float = 0.0
+    max_valid_pct: float = 100.0
+
+    # ── Abnormal-drop detection (leak / theft) ────────────────────────
+    # Alert when the level falls this many points inside
+    # drop_window_minutes. 0 disables. Off by default because the right
+    # threshold depends on tank size and site behaviour.
+    drop_alert_pct: float = 0.0
+    drop_window_minutes: int = 60
+    # Only evaluate while the engine is NOT burning fuel. A loaded
+    # generator drawing the tank down is expected and would alert on every
+    # outage; the same fall with the engine stopped is a leak or a siphon.
+    drop_only_when_stopped: bool = True
 
 
 class MqttConfig(BaseModel):
@@ -519,6 +588,7 @@ class Settings(BaseSettings):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    fuel: FuelConfig = Field(default_factory=FuelConfig)
     mqtt: MqttConfig = Field(default_factory=MqttConfig)
     ats: AtsConfig = Field(default_factory=AtsConfig)
 

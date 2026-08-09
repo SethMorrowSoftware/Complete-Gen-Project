@@ -4,6 +4,7 @@ import type {
   ConfirmToken,
   EventRow,
   MeBody,
+  FuelUpdate,
   MqttUpdate,
   Reading,
   Role,
@@ -259,6 +260,7 @@ export const api = {
     modbus?: any;
     retention?: any;
     slack?: SlackUpdate;
+    fuel?: FuelUpdate;
     mqtt?: MqttUpdate;
     ws_push_ms?: number;
   }) =>
@@ -266,6 +268,7 @@ export const api = {
       ok: boolean;
       restart_required: boolean;
       slack_updated?: boolean;
+      fuel_updated?: boolean;
       mqtt_updated?: boolean;
     }>("/api/config", {
       method: "PUT",
@@ -274,7 +277,7 @@ export const api = {
   // `kind` picks which alert route to exercise — the transfer and
   // security alerts can each have their own channel and mention, and an
   // operator should be able to prove that plumbing before an outage does.
-  testSlack: (kind: "generic" | "load_source" | "security" = "generic") =>
+  testSlack: (kind: "generic" | "load_source" | "fuel" | "security" = "generic") =>
     request<{ ok: boolean; detail: string }>(
       `/api/slack/test?kind=${kind}`, { method: "POST" }
     ),

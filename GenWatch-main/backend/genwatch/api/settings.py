@@ -75,11 +75,26 @@ async def get_config(
             "mentionOnTransferToGenerator": s.slack.mention_on_transfer_to_generator,
             "mentionOnReturnToUtility": s.slack.mention_on_return_to_utility,
             "loadSourceDebounceS": s.slack.load_source_debounce_s,
+            "alertOnFuelWarning": s.slack.alert_on_fuel_warning,
+            "alertOnFuelCritical": s.slack.alert_on_fuel_critical,
+            "alertOnFuelReminder": s.slack.alert_on_fuel_reminder,
+            "alertOnFuelRecovered": s.slack.alert_on_fuel_recovered,
+            "alertOnFuelDrop": s.slack.alert_on_fuel_drop,
+            "channelFuel": s.slack.channel_fuel,
+            "mentionOnFuelCritical": s.slack.mention_on_fuel_critical,
             "alertOnLoginFailure": s.slack.alert_on_login_failure,
             "alertOnAccountLockout": s.slack.alert_on_account_lockout,
             "alertOnLoginSuccess": s.slack.alert_on_login_success,
             "alertOnUserChange": s.slack.alert_on_user_change,
             "channelSecurity": s.slack.channel_security,
+        },
+        "fuel": {
+            **s.fuel.model_dump(),
+            # Tank size and fuel type come from the register map, not
+            # config.yaml, but the UI needs them to show gallons and to
+            # explain why a gaseous site never alerts.
+            "tankGal": request.app.state.regmap.site.tank_gal,
+            "fuelType": request.app.state.regmap.site.fuel_type,
         },
         "mqtt": {
             "enabled": s.mqtt.enabled,
@@ -123,6 +138,14 @@ class SlackUpdate(BaseModel):
     mention_on_transfer_to_generator: str | None = None
     mention_on_return_to_utility: str | None = None
     load_source_debounce_s: float | None = None
+    # Fuel alerts (thresholds live in the `fuel` section).
+    alert_on_fuel_warning: bool | None = None
+    alert_on_fuel_critical: bool | None = None
+    alert_on_fuel_reminder: bool | None = None
+    alert_on_fuel_recovered: bool | None = None
+    alert_on_fuel_drop: bool | None = None
+    channel_fuel: str | None = None
+    mention_on_fuel_critical: str | None = None
     # Sign-in / account security alerts.
     alert_on_login_failure: bool | None = None
     alert_on_account_lockout: bool | None = None
@@ -149,6 +172,19 @@ class MqttUpdate(BaseModel):
     publish_on_start: bool | None = None
 
 
+class FuelUpdate(BaseModel):
+    enabled: bool | None = None
+    warn_pct: float | None = None
+    critical_pct: float | None = None
+    hysteresis_pct: float | None = None
+    renotify_hours: float | None = None
+    min_valid_pct: float | None = None
+    max_valid_pct: float | None = None
+    drop_alert_pct: float | None = None
+    drop_window_minutes: int | None = None
+    drop_only_when_stopped: bool | None = None
+
+
 class ConfigUpdate(BaseModel):
     transport: str | None = None
     serial: dict | None = None
@@ -156,6 +192,7 @@ class ConfigUpdate(BaseModel):
     modbus: dict | None = None
     retention: dict | None = None
     slack: SlackUpdate | None = None
+    fuel: FuelUpdate | None = None
     mqtt: MqttUpdate | None = None
     ws_push_ms: int | None = None
 
@@ -211,6 +248,13 @@ async def update_config(
             on_disk.setdefault("slack", {}).update(slack_patch)
             slack_changed = True
 
+    fuel_changed = False
+    if body.fuel is not None:
+        fuel_patch = body.fuel.model_dump(exclude_none=True)
+        if fuel_patch:
+            on_disk.setdefault("fuel", {}).update(fuel_patch)
+            fuel_changed = True
+
     mqtt_changed = False
     if body.mqtt is not None:
         # Same rule as slack: only the fields sent; password == "" clears.
@@ -241,6 +285,10 @@ async def update_config(
         merged = {**s.slack.model_dump(), **slack_patch}
         settings_updates["slack"] = SlackConfig(**merged)
 
+    if fuel_changed:
+        from ..config import FuelConfig
+        settings_updates["fuel"] = FuelConfig(**{**s.fuel.model_dump(), **fuel_patch})
+
     mqtt_for_audit = None
     if mqtt_changed:
         from ..config import MqttConfig
@@ -258,6 +306,14 @@ async def update_config(
             notifier = getattr(request.app.state, "slack", None)
             if notifier is not None:
                 notifier.update_config(settings_updates["slack"])
+        if fuel_changed:
+            # Hot-reload the live monitor. It keeps its accumulated state
+            # (current status, reminder timer, drop history) across the
+            # swap, so raising a threshold doesn't re-announce a tank
+            # that was already low.
+            sm = getattr(request.app.state, "state_machine", None)
+            if sm is not None and getattr(sm, "fuel", None) is not None:
+                sm.fuel.update_config(settings_updates["fuel"])
         if mqtt_changed:
             publisher = getattr(request.app.state, "mqtt", None)
             if publisher is not None:
@@ -275,14 +331,15 @@ async def update_config(
         body.transport, body.serial, body.modbus_tcp, body.modbus, body.retention, body.ws_push_ms,
     ))
     log.info(
-        "config updated on disk by %s (slack=%s, mqtt=%s, restart_required=%s)",
-        p.operator, slack_changed, mqtt_changed, restart_required,
+        "config updated on disk by %s (slack=%s, fuel=%s, mqtt=%s, restart_required=%s)",
+        p.operator, slack_changed, fuel_changed, mqtt_changed, restart_required,
     )
     return {
         "ok": True,
         "configPath": str(cfg_path),
         "restart_required": restart_required,
         "slack_updated": slack_changed,
+        "fuel_updated": fuel_changed,
         "mqtt_updated": mqtt_changed,
     }
 
@@ -290,7 +347,7 @@ async def update_config(
 @router.post("/slack/test")
 async def test_slack(
     request: Request,
-    kind: str = Query("generic", pattern="^(generic|load_source|security)$"),
+    kind: str = Query("generic", pattern="^(generic|load_source|fuel|security)$"),
     p: Principal = Depends(require_admin),
 ) -> dict:
     """Send a synchronous test message to Slack.
@@ -300,8 +357,8 @@ async def test_slack(
     failure so the UI can surface the Slack error verbatim instead of
     swallowing it as an HTTP error.
 
-    ``kind`` selects which alert *route* to exercise — the transfer alerts
-    and the security alerts can each be pointed at their own channel with
+    ``kind`` selects which alert *route* to exercise — the transfer, fuel
+    and security alerts can each be pointed at their own channel with
     their own mention text, and an operator should be able to prove that
     plumbing works before an outage is what tests it.
     """

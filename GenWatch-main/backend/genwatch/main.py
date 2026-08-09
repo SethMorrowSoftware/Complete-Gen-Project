@@ -273,7 +273,25 @@ async def lifespan(app: FastAPI):
     else:
         log.info("ATS-Pi integration disabled (ats.enabled=false)")
 
-    state_machine = StateMachine(regmap, db, bus, ats_service=ats_service)
+    state_machine = StateMachine(
+        regmap, db, bus, ats_service=ats_service, fuel_cfg=settings.fuel,
+    )
+    if settings.fuel.enabled:
+        log.info(
+            "Fuel monitoring enabled — warn<=%.0f%% critical<=%.0f%% "
+            "(hysteresis %.0f%%, remind every %.0fh, drop alert %s), tank %d gal, fuel %s",
+            settings.fuel.warn_pct, settings.fuel.critical_pct,
+            settings.fuel.hysteresis_pct, settings.fuel.renotify_hours,
+            f"{settings.fuel.drop_alert_pct:.0f}%/{settings.fuel.drop_window_minutes}min"
+            if settings.fuel.drop_alert_pct > 0 else "off",
+            regmap.site.tank_gal, regmap.site.fuel_type,
+        )
+        if regmap.site.fuel_type == "gaseous":
+            log.warning(
+                "fuel.enabled is true but site.fuel_type is 'gaseous' — a gaseous "
+                "site has no local tank to run out of, so fuel alerts stay inert. "
+                "Set site.fuel_type in the register map if this site does have a tank."
+            )
     control_service = ControlService(regmap, client, db, state_machine, slack=slack)
 
     # ATS-Pi command service (Phase 3) — only when the companion is
@@ -750,6 +768,17 @@ async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
         await slack.alert_load_source_change(
             old=str(evt.get("from", "")),
             new=str(evt.get("to", "")),
+            ts=ts,
+        )
+    elif t == "fuel":
+        await slack.alert_fuel(
+            kind=str(evt.get("kind", "level")),
+            status=str(evt.get("status", "unknown")),
+            pct=float(evt.get("pct", 0.0)),
+            gallons=evt.get("gallons"),
+            message=str(evt.get("desc", "")),
+            dropped_pct=float(evt.get("droppedPct", 0.0)),
+            window_minutes=int(evt.get("windowMinutes", 0)),
             ts=ts,
         )
 

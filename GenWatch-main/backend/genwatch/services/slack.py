@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 from ..config import SlackConfig
 from ..db import Database
+from .fuel import fmt_pct
 
 log = logging.getLogger("genwatch.slack")
 
@@ -364,6 +365,76 @@ class SlackNotifier:
             fallback=f"Modbus comms {old} → {new} ({success_pct:.0f}%) @ {self._site()}",
         )
 
+    # ---- fuel ---------------------------------------------------------
+    async def alert_fuel(
+        self,
+        *,
+        kind: str,
+        status: str,
+        pct: float,
+        gallons: int | None = None,
+        message: str = "",
+        dropped_pct: float = 0.0,
+        window_minutes: int = 0,
+        ts: float = 0.0,
+    ) -> None:
+        """Low-fuel tiers, the periodic reminder, refuelling, and the
+        abnormal-drop alert.
+
+        The condition itself (thresholds, hysteresis, when to remind) is
+        decided in services/fuel.py — everything here is routing and
+        wording. The mention is attached only to the critical tier and the
+        drop alert: an "order fuel this week" warning that pings @channel
+        at 2 a.m. teaches people to mute the channel.
+        """
+        flag = {
+            "drop": self.cfg.alert_on_fuel_drop,
+            "reminder": self.cfg.alert_on_fuel_reminder,
+            "recovered": self.cfg.alert_on_fuel_recovered,
+        }.get(kind)
+        if flag is None:  # kind == "level"
+            flag = (
+                self.cfg.alert_on_fuel_critical if status == "critical"
+                else self.cfg.alert_on_fuel_warning
+            )
+        if not flag:
+            return
+
+        if kind == "drop":
+            emoji, sev = ":rotating_light:", "alarm"
+            title = f"{emoji} Fuel dropping — {dropped_pct:.0f}% in under {window_minutes} min"
+        elif kind == "recovered":
+            emoji, sev = ":fuelpump:", "ok"
+            title = f"{emoji} Fuel replenished — {fmt_pct(pct)}"
+        elif status == "critical":
+            emoji, sev = ":rotating_light:", "alarm"
+            title = f"{emoji} Fuel CRITICAL — {fmt_pct(pct)}"
+        else:
+            emoji, sev = ":warning:", "warn"
+            title = f"{emoji} Fuel low — {fmt_pct(pct)}"
+        if kind == "reminder":
+            title += " (still)"
+
+        fields = [("Level", fmt_pct(pct))]
+        if gallons is not None:
+            fields.append(("Approx. remaining", f"{gallons} gal"))
+        if kind == "drop":
+            fields.append(("Dropped", f"{dropped_pct:.0f}% / {window_minutes} min"))
+        fields.append(("Site", self._site()))
+
+        mention = (
+            self.cfg.mention_on_fuel_critical
+            if (status == "critical" or kind == "drop") else ""
+        )
+        await self._enqueue(
+            severity=sev,
+            title=title,
+            fields=fields,
+            fallback=message or f"Fuel {status} at {fmt_pct(pct)} @ {self._site()}",
+            channel=self.cfg.channel_fuel,
+            mention=mention,
+        )
+
     # ---- security events ----------------------------------------------
     # An internet-exposed login deserves the same treatment as an alarm
     # bit: the operator finds out from Slack, not from reading the audit
@@ -450,6 +521,7 @@ class SlackNotifier:
 
           generic      — the plain channel
           load_source  — channel_load_source + mention_on_transfer_to_generator
+          fuel         — channel_fuel + mention_on_fuel_critical
           security     — channel_security
         """
         if not self.cfg.bot_token:
@@ -476,6 +548,12 @@ class SlackNotifier:
                 self.cfg.channel_load_source or self.cfg.channel,
                 self.cfg.mention_on_transfer_to_generator,
                 "transfer alert",
+            )
+        if kind == "fuel":
+            return (
+                self.cfg.channel_fuel or self.cfg.channel,
+                self.cfg.mention_on_fuel_critical,
+                "fuel alert",
             )
         if kind == "security":
             return (self.cfg.channel_security or self.cfg.channel, "", "security alert")

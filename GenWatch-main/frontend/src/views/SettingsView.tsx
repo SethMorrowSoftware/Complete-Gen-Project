@@ -7,7 +7,10 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
-import type { MeBody, MqttConfigView, MqttUpdate, SlackConfigView, SlackUpdate } from "../types";
+import type {
+  FuelConfigView, FuelUpdate, MeBody, MqttConfigView, MqttUpdate,
+  SlackConfigView, SlackUpdate,
+} from "../types";
 import { AccountSection } from "./AccountSection";
 import { UsersSection } from "./UsersSection";
 
@@ -44,6 +47,7 @@ interface Config {
     ipAllowlistCount: number;
   };
   slack: SlackConfigView;
+  fuel: FuelConfigView;
   mqtt: MqttConfigView;
 }
 
@@ -53,7 +57,7 @@ export function SettingsView({ auth, onAuthChanged }: {
 }) {
   const [section, setSection] = useState<Section>("link");
   const [cfg, setCfg] = useState<Config | null>(null);
-  const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate; mqtt: MqttUpdate }>>({});
+  const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate; fuel: FuelUpdate; mqtt: MqttUpdate }>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +75,7 @@ export function SettingsView({ auth, onAuthChanged }: {
     modbus: { ...cfg.modbus, ...(dirty.modbus || {}) },
     retention: { ...cfg.retention, ...(dirty.retention || {}) },
     slack: { ...cfg.slack, ...(dirty.slack || {}) },
+    fuel: { ...cfg.fuel, ...(dirty.fuel || {}) },
     mqtt: { ...cfg.mqtt, ...(dirty.mqtt || {}) },
   };
   const hasDirty = Object.keys(dirty).length > 0;
@@ -81,7 +86,7 @@ export function SettingsView({ auth, onAuthChanged }: {
     setSaved(null);
     try {
       const r = await api.updateConfig(dirty as any);
-      const liveUpdated = [r.slack_updated && "Slack", r.mqtt_updated && "MQTT"].filter(Boolean).join(" + ");
+      const liveUpdated = [r.slack_updated && "Slack", r.fuel_updated && "Fuel", r.mqtt_updated && "MQTT"].filter(Boolean).join(" + ");
       let message = "Saved.";
       if (r.restart_required) {
         message = liveUpdated
@@ -182,6 +187,8 @@ export function SettingsView({ auth, onAuthChanged }: {
               v={effective.slack}
               dirty={dirty.slack ?? {}}
               set={(patch) => setDirty((d) => ({ ...d, slack: { ...(d.slack || {}), ...patch } }))}
+              fuel={effective.fuel}
+              setFuel={(patch) => setDirty((d) => ({ ...d, fuel: { ...(d.fuel || {}), ...patch } }))}
             />
           )}
           {section === "mqtt" && (
@@ -579,11 +586,13 @@ function SecuritySection({ cfg }: { cfg: Config }) {
 }
 
 function SlackSection({
-  v, dirty, set,
+  v, dirty, set, fuel, setFuel,
 }: {
   v: SlackConfigView;
   dirty: SlackUpdate;
   set: (patch: SlackUpdate) => void;
+  fuel: FuelConfigView;
+  setFuel: (patch: FuelUpdate) => void;
 }) {
   // Token UX: don't show the existing token (we don't have it client-side
   // anyway). Display "Configured" badge when the server reports one;
@@ -595,7 +604,7 @@ function SlackSection({
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
 
-  const runTest = async (kind: "generic" | "load_source" | "security" = "generic") => {
+  const runTest = async (kind: "generic" | "load_source" | "fuel" | "security" = "generic") => {
     setTesting(kind);
     setTestResult(null);
     try {
@@ -808,6 +817,169 @@ function SlackSection({
         </div>
       </div>
 
+      {/* ── Fuel alerts ─────────────────────────────────────────────── */}
+      <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <h2 style={{ fontSize: 13 }}>Fuel level</h2>
+        <p>
+          Two tiers, because they mean different things to whoever gets the message: "order fuel
+          this week" and "you have hours of runtime left". Unlike the register range-alarms, these
+          are evaluated whether or not the engine is running — a tank running dry matters most
+          while the generator is stopped and there is still time to do something about it.
+          {fuel.fuelType === "gaseous" && (
+            <> <strong>This site is configured as gaseous-fuel</strong>, so it has no local tank
+            and fuel alerts stay inert.</>
+          )}
+        </p>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Monitor fuel level
+          <span className="desc">
+            Off by default: <span className="mono">fuel_level_pct</span> isn't verified on every
+            H-100 revision. Confirm the reading against the panel with{" "}
+            <span className="mono">genwatch panel</span> before turning this on — a false "FUEL
+            EMPTY" page is how a site learns to ignore its alerts. Readings outside{" "}
+            {fuel.min_valid_pct}–{fuel.max_valid_pct}% are treated as a sensor fault and stay silent.
+          </span>
+        </div>
+        <Switch value={!!fuel.enabled} onChange={(b) => setFuel({ enabled: b })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Low threshold
+          <span className="desc">
+            Warn at or below this level
+            {fuel.tankGal > 0 && ` — about ${Math.round(fuel.warn_pct * fuel.tankGal / 100)} gal of a ${fuel.tankGal} gal tank`}
+          </span>
+        </div>
+        <div className="flex ai-c gap-8">
+          <input className="input mono" type="number" min={0} max={100} step={1} style={{ width: 110 }}
+                 value={fuel.warn_pct} onChange={(e) => setFuel({ warn_pct: Number(e.target.value) })} />
+          <span className="desc">%</span>
+        </div>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Critical threshold
+          <span className="desc">
+            The one worth a mention
+            {fuel.tankGal > 0 && ` — about ${Math.round(fuel.critical_pct * fuel.tankGal / 100)} gal`}
+          </span>
+        </div>
+        <div className="flex ai-c gap-8">
+          <input className="input mono" type="number" min={0} max={100} step={1} style={{ width: 110 }}
+                 value={fuel.critical_pct} onChange={(e) => setFuel({ critical_pct: Number(e.target.value) })} />
+          <span className="desc">%</span>
+        </div>
+      </div>
+      {fuel.critical_pct >= fuel.warn_pct && (
+        <div style={{ padding: "0 22px 12px", fontSize: 12, color: "var(--amber)" }}>
+          The critical threshold should sit below the low threshold, or the low tier never fires.
+        </div>
+      )}
+
+      <div className="field-row">
+        <div className="lbl">
+          Hysteresis
+          <span className="desc">
+            A tank on a running genset sloshes. The level has to rise this far above a threshold
+            before we call the situation improved, so a sender hovering on the line warns once
+            instead of flapping between warn and clear.
+          </span>
+        </div>
+        <div className="flex ai-c gap-8">
+          <input className="input mono" type="number" min={0} max={25} step={1} style={{ width: 110 }}
+                 value={fuel.hysteresis_pct} onChange={(e) => setFuel({ hysteresis_pct: Number(e.target.value) })} />
+          <span className="desc">%</span>
+        </div>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Remind while still low
+          <span className="desc">
+            Low fuel is a condition somebody has to act on — silence after the first message reads
+            as "handled". 0 = say it once.
+          </span>
+        </div>
+        <div className="flex ai-c gap-8">
+          <input className="input mono" type="number" min={0} max={168} step={1} style={{ width: 110 }}
+                 value={fuel.renotify_hours} onChange={(e) => setFuel({ renotify_hours: Number(e.target.value) })} />
+          <span className="desc">hours</span>
+        </div>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Abnormal-drop alert
+          <span className="desc">
+            Alert when the level falls this far inside the window below — the leak / siphon signal.
+            0 = off. The right value depends on your tank size.
+          </span>
+        </div>
+        <div className="flex ai-c gap-8">
+          <input className="input mono" type="number" min={0} max={100} step={1} style={{ width: 90 }}
+                 value={fuel.drop_alert_pct} onChange={(e) => setFuel({ drop_alert_pct: Number(e.target.value) })} />
+          <span className="desc">% within</span>
+          <input className="input mono" type="number" min={1} max={1440} step={5} style={{ width: 90 }}
+                 value={fuel.drop_window_minutes} onChange={(e) => setFuel({ drop_window_minutes: Number(e.target.value) })} />
+          <span className="desc">min</span>
+        </div>
+      </div>
+
+      {fuel.drop_alert_pct > 0 && (
+        <div className="field-row">
+          <div className="lbl">
+            Only when stopped
+            <span className="desc">
+              A loaded generator drawing the tank down is expected — leave this on or the drop
+              alert fires on every outage. Turn it off if you also want to catch an unexpectedly
+              high burn rate while running.
+            </span>
+          </div>
+          <Switch value={!!fuel.drop_only_when_stopped}
+                  onChange={(b) => setFuel({ drop_only_when_stopped: b })} />
+        </div>
+      )}
+
+      <SlackToggle label="Fuel low (warning tier)"
+        desc="Crossed the low threshold"
+        value={v.alertOnFuelWarning} onChange={(b) => set({ alert_on_fuel_warning: b })} />
+      <SlackToggle label="Fuel critical"
+        desc="Crossed the critical threshold"
+        value={v.alertOnFuelCritical} onChange={(b) => set({ alert_on_fuel_critical: b })} />
+      <SlackToggle label="Still-low reminders"
+        desc="The periodic repeat while the tank stays low"
+        value={v.alertOnFuelReminder} onChange={(b) => set({ alert_on_fuel_reminder: b })} />
+      <SlackToggle label="Refuelled"
+        desc="The level recovered — closes the loop on an earlier alert"
+        value={v.alertOnFuelRecovered} onChange={(b) => set({ alert_on_fuel_recovered: b })} />
+      <SlackToggle label="Abnormal drop"
+        desc="Possible leak or theft (needs the drop alert configured above)"
+        value={v.alertOnFuelDrop} onChange={(b) => set({ alert_on_fuel_drop: b })} />
+
+      <div className="field-row">
+        <div className="lbl">Fuel channel <span className="desc">Blank = use the main channel</span></div>
+        <input className="input" placeholder="(same as main channel)"
+               value={v.channelFuel} onChange={(e) => set({ channel_fuel: e.target.value })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Mention on critical
+          <span className="desc">
+            Applied to the critical tier and the drop alert only — a "order fuel this week"
+            warning that pings @channel at 2 a.m. teaches people to mute the channel.
+          </span>
+        </div>
+        <input className="input mono" placeholder="<!channel>"
+               value={v.mentionOnFuelCritical}
+               onChange={(e) => set({ mention_on_fuel_critical: e.target.value })} />
+      </div>
+
       {/* ── Security alerts ─────────────────────────────────────────── */}
       <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
         <h2 style={{ fontSize: 13 }}>Sign-in &amp; account alerts</h2>
@@ -863,6 +1035,9 @@ function SlackSection({
           </button>
           <button className="btn" disabled={testDisabled} onClick={() => runTest("load_source")}>
             {testing === "load_source" ? "Sending…" : "Transfer route"}
+          </button>
+          <button className="btn" disabled={testDisabled} onClick={() => runTest("fuel")}>
+            {testing === "fuel" ? "Sending…" : "Fuel route"}
           </button>
           <button className="btn" disabled={testDisabled} onClick={() => runTest("security")}>
             {testing === "security" ? "Sending…" : "Security route"}
