@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, setUnauthorizedHandler } from "./api/client";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { BrandMark, Icon, IconButton } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
 import type { MeBody } from "./types";
@@ -320,12 +321,19 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onAuthChanged, onLog
         )}
         {tickedStatus && (
           <div className="view" key={view}>
-            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} role={auth.role ?? "viewer"} stale={stale} panelStale={panelStale} />}
-            {view === "history" && <HistoryView />}
-            {view === "events" && <EventsView />}
-            {view === "settings" && (
-              <SettingsView auth={auth} onAuthChanged={onAuthChanged} />
-            )}
+            {/* Per-view boundary: a render error costs you that view, not
+                the whole console. The topbar keeps showing comms health —
+                which is the thing you actually need during an outage —
+                and the other tabs still work. Keyed on `view` so
+                switching tabs clears a previous crash. */}
+            <ErrorBoundary key={view} label={view}>
+              {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} role={auth.role ?? "viewer"} stale={stale} panelStale={panelStale} />}
+              {view === "history" && <HistoryView />}
+              {view === "events" && <EventsView />}
+              {view === "settings" && (
+                <SettingsView auth={auth} onAuthChanged={onAuthChanged} />
+              )}
+            </ErrorBoundary>
           </div>
         )}
       </main>

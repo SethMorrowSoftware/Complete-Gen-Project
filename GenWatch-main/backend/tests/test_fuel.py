@@ -487,3 +487,27 @@ async def test_fuel_slack_flags_round_trip(client):
     assert cfg["alertOnFuelWarning"] is False
     assert cfg["channelFuel"] == "#fuel-alerts"
     assert app.state.slack.cfg.mention_on_fuel_critical == "<!channel>"
+
+
+async def test_config_response_carries_every_section_the_ui_reads(client):
+    """Pin the /api/config contract.
+
+    The Settings page reads through these sections, and a missing one used
+    to throw during render and blank the whole console (the UI now fills in
+    defaults, but the API should not be the thing that needs forgiving).
+    Dropping or renaming a section here is a breaking change for the
+    browser, so make it fail loudly in CI instead of at an operator's desk.
+    """
+    c, _app = client
+    cfg = (await c.get("/api/config")).json()
+    for section in ("serial", "modbus_tcp", "modbus", "retention",
+                    "auth", "security", "slack", "fuel", "mqtt"):
+        assert isinstance(cfg.get(section), dict), f"/api/config is missing {section!r}"
+
+    # Fields the UI reads that don't come from config.yaml — they're pulled
+    # from the register map, so they're easy to lose in a refactor.
+    assert "tankGal" in cfg["fuel"]
+    assert "fuelType" in cfg["fuel"]
+    # Secrets must never appear, in any section.
+    blob = str(cfg)
+    assert "bot_token" not in blob and "jwt_secret" not in blob
