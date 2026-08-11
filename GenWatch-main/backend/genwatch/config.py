@@ -131,6 +131,27 @@ class AuthConfig(BaseModel):
     jwt_secret: str = ""  # filled at install-time
     session_hours: int = 12
 
+    # ── "Keep me signed in" (remember me) ─────────────────────────────
+    # Lifetime, in days, of a session started with the login form's
+    # "keep me signed in on this device" box ticked. Remembered sessions
+    # are exempt from idle_timeout_minutes, and are silently renewed
+    # whenever the device uses the console with less than half the
+    # lifetime left — so a device that signs in once stays signed in for
+    # as long as it keeps being used at least once per remember_me_days.
+    #
+    # This trades "a stolen laptop holds a live session" for "the boss
+    # doesn't retype a password every shift". Every revocation path still
+    # applies in full: logout, a password change, disabling the account,
+    # and Settings → Users → sign-out-everywhere all kill a remembered
+    # session immediately, and it is listed like any other session under
+    # Settings → My Account.
+    #
+    # 0 disables the feature — the checkbox is ignored server-side and
+    # every login gets a plain session_hours session. Values past ~400
+    # are academic: Chrome caps cookie lifetime at 400 days (renewal
+    # re-issues the cookie, so the session itself survives regardless).
+    remember_me_days: int = 365
+
     # ── Login hardening ───────────────────────────────────────────────
     # Sessions also expire after this much inactivity, independent of
     # session_hours. An operator who leaves the console open on a shop

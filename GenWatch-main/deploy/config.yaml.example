@@ -121,6 +121,19 @@ auth:
   # session alive forever); the UI sends a keepalive on real user input.
   # 0 disables it — absolute expiry via session_hours still applies.
   idle_timeout_minutes: 60
+  # Lifetime, in days, of a "keep me signed in on this device" session
+  # (the checkbox on the login form). Remembered sessions skip the idle
+  # timeout and silently renew while the device keeps using the console,
+  # so a trusted device signs in once and stays signed in. Every
+  # revocation path still applies: logout, password change, disabling
+  # the account, and Settings → Users → sign-out-everywhere all end a
+  # remembered session immediately, and each one is listed under
+  # Settings → My Account. 0 disables the feature (the checkbox is then
+  # ignored and every login gets a session_hours session). On an
+  # internet-facing console pair this with require_totp — a long-lived
+  # cookie on a stolen laptop is a live session for however long is set
+  # here.
+  remember_me_days: 365
 
   # ── Brute-force defence ────────────────────────────────────────────
   # Two independent layers. The per-IP bucket stops one host hammering

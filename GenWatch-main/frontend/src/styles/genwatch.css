@@ -1804,6 +1804,22 @@ a { color: inherit; }
   border: 1px solid color-mix(in oklch, var(--red) 40%, var(--border));
   animation: alarm-enter 260ms var(--ease);
 }
+.login-remember {
+  display: flex; align-items: flex-start; gap: 10px;
+  cursor: pointer; user-select: none;
+}
+.login-remember input[type="checkbox"] {
+  appearance: auto; accent-color: var(--blue);
+  width: 15px; height: 15px; margin-top: 2px; flex: none;
+  cursor: pointer;
+}
+.login-remember span {
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: 13px; font-weight: 500; color: var(--text-2);
+}
+.login-remember em {
+  font-style: normal; font-size: 11px; font-weight: 500; color: var(--text-4);
+}
 .login-submit {
   justify-content: center; padding: 13px 18px; margin-top: 4px;
   font-size: 14px; font-weight: 600;

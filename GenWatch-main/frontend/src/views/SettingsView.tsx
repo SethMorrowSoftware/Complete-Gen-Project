@@ -55,6 +55,7 @@ interface Config {
     operatorName: string;
     sessionHours: number;
     idleTimeoutMinutes: number;
+    rememberMeDays: number;
     passwordConfigured: boolean;
     jwtSecretConfigured: boolean;
     requireTotp: boolean;
@@ -114,6 +115,7 @@ const AUTH_DEFAULTS: Config["auth"] = {
   operatorName: "operator",
   sessionHours: 12,
   idleTimeoutMinutes: 0,
+  rememberMeDays: 0,
   passwordConfigured: false,
   jwtSecretConfigured: false,
   requireTotp: false,
@@ -618,8 +620,12 @@ function SecuritySection({ cfg }: { cfg: Config }) {
     },
     {
       label: "Session limits", ok: a.idleTimeoutMinutes > 0,
-      value: `${a.sessionHours} h max · ${a.idleTimeoutMinutes || "no"} min idle`,
-      desc: "Sessions are server-side: logout, a password change, or an admin revoke kills them immediately.",
+      value: `${a.sessionHours} h max · ${a.idleTimeoutMinutes || "no"} min idle`
+        + (a.rememberMeDays > 0 ? ` · remembered ${a.rememberMeDays} d` : ""),
+      desc: "Sessions are server-side: logout, a password change, or an admin revoke kills them immediately."
+        + (a.rememberMeDays > 0
+          ? " “Keep me signed in” devices skip the idle timeout and renew while in use."
+          : ""),
     },
     {
       label: "Response hardening", ok: s.headersEnabled, value: s.headersEnabled ? "on" : "off",

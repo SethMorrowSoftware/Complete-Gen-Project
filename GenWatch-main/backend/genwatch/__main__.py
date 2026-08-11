@@ -417,7 +417,8 @@ def _doctor(args: list[str]) -> int:
         print(f"            https_required={settings.https_required} "
               f"require_totp={auth.require_totp} "
               f"lockout={auth.lockout_seconds}s "
-              f"idle_timeout={auth.idle_timeout_minutes}min")
+              f"idle_timeout={auth.idle_timeout_minutes}min "
+              f"remember_me={auth.remember_me_days}d")
         if not settings.https_required:
             print("            WARNING: plain HTTP is still accepted")
         if not auth.require_totp:

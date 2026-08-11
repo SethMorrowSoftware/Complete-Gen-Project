@@ -40,6 +40,7 @@ async def get_config(
             "operatorName": s.auth.operator_name,
             "sessionHours": s.auth.session_hours,
             "idleTimeoutMinutes": s.auth.idle_timeout_minutes,
+            "rememberMeDays": s.auth.remember_me_days,
             "passwordConfigured": bool(s.auth.admin_password_hash),
             "jwtSecretConfigured": bool(s.auth.jwt_secret),
             "requireTotp": s.auth.require_totp,

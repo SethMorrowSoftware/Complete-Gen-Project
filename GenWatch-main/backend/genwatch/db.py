@@ -171,7 +171,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at   REAL    NOT NULL,
     revoked_at   REAL,
     ip           TEXT    NOT NULL DEFAULT '',
-    user_agent   TEXT    NOT NULL DEFAULT ''
+    user_agent   TEXT    NOT NULL DEFAULT '',
+    -- "Keep me signed in" session: long absolute lifetime, exempt from
+    -- the idle timeout, renewed while the device stays in use.
+    remember     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
@@ -245,6 +248,22 @@ class Database:
     def _init_schema(self) -> None:
         with self._wlock:
             self._wconn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for databases that predate a column.
+
+        CREATE TABLE IF NOT EXISTS never alters an existing table, so a
+        deployed SQLite file keeps its original shape forever unless new
+        columns are bolted on here. Only ADD COLUMN with a constant
+        default is allowed — anything more belongs in a real migration
+        with its own backup story.
+        """
+        cols = {r["name"] for r in self._wconn.execute("PRAGMA table_info(sessions)")}
+        if "remember" not in cols:
+            self._wconn.execute(
+                "ALTER TABLE sessions ADD COLUMN remember INTEGER NOT NULL DEFAULT 0"
+            )
 
     @contextmanager
     def _writer(self):
@@ -744,13 +763,16 @@ class Database:
     def session_create(
         self, *, jti: str, user_id: int, username: str,
         expires_at: float, ip: str = "", user_agent: str = "",
+        remember: bool = False,
     ) -> None:
         now = time.time()
         with self._writer() as c:
             c.execute(
                 "INSERT INTO sessions (jti, user_id, username, created_at, "
-                "last_seen_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (jti, user_id, username, now, now, expires_at, ip, user_agent[:200]),
+                "last_seen_at, expires_at, ip, user_agent, remember) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (jti, user_id, username, now, now, expires_at, ip,
+                 user_agent[:200], int(remember)),
             )
 
     def session_get(self, jti: str) -> dict | None:
@@ -761,6 +783,20 @@ class Database:
     def session_touch(self, jti: str) -> None:
         with self._writer() as c:
             c.execute("UPDATE sessions SET last_seen_at = ? WHERE jti = ?", (time.time(), jti))
+
+    def session_extend(self, jti: str, expires_at: float) -> bool:
+        """Push a live session's absolute expiry out (remember-me renewal).
+        Refuses to resurrect a revoked or already-expired row — renewal is
+        for sessions that are still valid, never a back door past
+        revocation. Returns True if a row was extended."""
+        now = time.time()
+        with self._writer() as c:
+            cur = c.execute(
+                "UPDATE sessions SET expires_at = ? "
+                "WHERE jti = ? AND revoked_at IS NULL AND expires_at > ?",
+                (expires_at, jti, now),
+            )
+            return (cur.rowcount or 0) > 0
 
     def session_revoke(self, jti: str) -> bool:
         with self._writer() as c:

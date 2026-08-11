@@ -27,6 +27,10 @@ export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [password, setPassword] = useState("");
   const [totp, setTotp] = useState("");
   const [needsTotp, setNeedsTotp] = useState(false);
+  // Default on: the common case here is an operator's own device, and
+  // re-typing a password every shift is how consoles end up with the
+  // password on a sticky note. Shared/borrowed machines untick it.
+  const [remember, setRemember] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -40,7 +44,7 @@ export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
     setError(null);
     setHint(null);
     try {
-      const r = await api.login(username, password, needsTotp ? totp : undefined);
+      const r = await api.login(username, password, needsTotp ? totp : undefined, remember);
       if (r.usedRecoveryCode) {
         // Worth saying out loud — they just burned a one-time code.
         console.info(`Signed in with a recovery code · ${r.recoveryCodesRemaining} left`);
@@ -135,6 +139,18 @@ export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
             />
           </label>
         )}
+
+        <label className="login-remember">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => setRemember(e.target.checked)}
+          />
+          <span>
+            Keep me signed in on this device
+            <em>Untick on a shared or borrowed computer</em>
+          </span>
+        </label>
 
         {hint && !error && (
           <div className="login-error" role="status"

@@ -126,6 +126,7 @@ export function AccountSection({ auth, onAuthChanged }: {
             <tr key={s.id}>
               <td className="mono">
                 {s.id}{s.current && <Pill tone="ok">this one</Pill>}
+                {s.remember && <Pill tone="info">stays signed in</Pill>}
               </td>
               <td className="mono">{s.ip || "—"}</td>
               <td className="mono" style={{ color: "var(--text-3)" }}>{when(s.createdAt)}</td>

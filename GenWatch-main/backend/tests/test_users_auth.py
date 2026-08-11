@@ -11,6 +11,7 @@ Covers, in order:
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 
 import httpx
@@ -669,6 +670,197 @@ async def test_websocket_traffic_does_not_extend_the_idle_window(client):
     # An ordinary request (the frontend's activity keepalive) does touch.
     assert (await c.get("/api/auth/me")).status_code == 200
     assert db.session_get(jti)["last_seen_at"] > stale
+
+
+# ─── "Keep me signed in" (remember me) ────────────────────────────────────
+
+
+def _session_row(app, username="admin"):
+    db = app.state.db
+    return db.sessions_for_user(db.user_get(username)["id"])[0]
+
+
+async def test_remember_me_login_mints_a_long_lived_session(client):
+    c, app = client
+    r = await _login(c, remember=True)
+    assert r.status_code == 200, r.text
+    assert r.json()["remembered"] is True
+
+    life_s = app.state.settings.auth.remember_me_days * 86400
+    # The browser cookie lives as long as the server-side session does.
+    cookie = r.headers["set-cookie"]
+    assert f"Max-Age={life_s}" in cookie
+
+    row = _session_row(app)
+    assert row["remember"] == 1
+    assert row["expires_at"] == pytest.approx(time.time() + life_s, abs=30)
+
+    # Visible for what it is in the sessions list and the audit trail.
+    sessions = (await c.get("/api/auth/sessions")).json()["sessions"]
+    assert sessions[0]["remember"] is True
+    with app.state.db._reader() as conn:
+        detail = conn.execute(
+            "SELECT detail FROM audit WHERE action='auth.login' "
+            "AND result='ok' ORDER BY id DESC LIMIT 1"
+        ).fetchone()["detail"]
+    assert "remembered" in detail
+
+
+async def test_ordinary_login_is_unchanged_by_the_feature(client):
+    c, app = client
+    r = await _login(c)
+    assert r.status_code == 200
+    assert r.json()["remembered"] is False
+    assert f"Max-Age={app.state.settings.auth.session_hours * 3600}" in r.headers["set-cookie"]
+    assert _session_row(app)["remember"] == 0
+
+
+async def test_remembered_session_skips_the_idle_timeout(client):
+    """The whole point of the checkbox: stepping away for longer than
+    idle_timeout_minutes must not sign the device out."""
+    c, app = client
+    await _login(c, remember=True)
+    idle = app.state.settings.auth.idle_timeout_minutes
+    assert idle > 0
+    with app.state.db._writer() as conn:
+        conn.execute("UPDATE sessions SET last_seen_at = ?", (time.time() - idle * 60 - 5,))
+    assert (await c.get("/api/status")).status_code == 200
+    assert _session_row(app)["revoked_at"] is None
+
+
+async def test_remember_me_days_zero_disables_the_feature(client):
+    """With remember_me_days: 0 the checkbox is ignored server-side —
+    the login succeeds but gets a plain session_hours session that the
+    idle timeout applies to."""
+    c, app = client
+    app.state.settings.auth.remember_me_days = 0
+    r = await _login(c, remember=True)
+    assert r.status_code == 200
+    assert r.json()["remembered"] is False
+    assert f"Max-Age={app.state.settings.auth.session_hours * 3600}" in r.headers["set-cookie"]
+    row = _session_row(app)
+    assert row["remember"] == 0
+    idle = app.state.settings.auth.idle_timeout_minutes
+    with app.state.db._writer() as conn:
+        conn.execute("UPDATE sessions SET last_seen_at = ?", (time.time() - idle * 60 - 5,))
+    assert (await c.get("/api/status")).status_code == 401
+
+
+async def test_remembered_session_renews_once_half_spent(client):
+    """Sliding renewal: /me on an aging remembered session pushes the
+    expiry back out to a full lifetime and re-issues the cookie, so a
+    device in regular use never reaches the login page again."""
+    c, app = client
+    await _login(c, remember=True)
+    jti = _session_row(app)["jti"]
+    life_s = app.state.settings.auth.remember_me_days * 86400
+
+    # Fresh session: plenty of runway, /me must not rewrite anything.
+    r = await c.get("/api/auth/me")
+    assert "set-cookie" not in r.headers
+    assert _session_row(app)["expires_at"] == pytest.approx(time.time() + life_s, abs=30)
+
+    # Age it past the renewal threshold (40% of life left).
+    with app.state.db._writer() as conn:
+        conn.execute(
+            "UPDATE sessions SET expires_at = ? WHERE jti = ?",
+            (time.time() + life_s * 0.4, jti),
+        )
+    r = await c.get("/api/auth/me")
+    assert r.status_code == 200 and r.json()["authenticated"] is True
+    assert f"Max-Age={life_s}" in r.headers["set-cookie"]
+    row = _session_row(app)
+    assert row["jti"] == jti  # same session, new horizon
+    assert row["expires_at"] == pytest.approx(time.time() + life_s, abs=30)
+
+    # And the renewed cookie is genuinely accepted.
+    assert (await c.get("/api/status")).status_code == 200
+
+
+async def test_renewal_never_resurrects_a_revoked_session(client):
+    """A revocation racing the renewal must win — renewal extends live
+    sessions, it is not a back door past logout or an admin revoke."""
+    from genwatch.services import session as session_svc
+
+    c, app = client
+    await _login(c, remember=True)
+    db = app.state.db
+    jti = _session_row(app)["jti"]
+    with db._writer() as conn:
+        conn.execute(
+            "UPDATE sessions SET expires_at = ? WHERE jti = ?", (time.time() + 60, jti)
+        )
+    db.session_revoke(jti)
+    assert (
+        session_svc.renew_if_due(db=db, auth_cfg=app.state.settings.auth, jti=jti)
+        is None
+    )
+    assert db.session_get(jti)["expires_at"] == pytest.approx(time.time() + 60, abs=30)
+
+
+async def test_password_change_keeps_the_remembered_flag(client):
+    """Rotating a password re-issues the caller's session; doing the
+    right thing shouldn't cost the device its keep-me-signed-in status."""
+    c, app = client
+    await _login(c, remember=True)
+    r = await c.post(
+        "/api/auth/password",
+        json={"current_password": "test-bootstrap-pw", "new_password": "Palisade-Kettle-58"},
+    )
+    assert r.status_code == 200, r.text
+    life_s = app.state.settings.auth.remember_me_days * 86400
+    rows = app.state.db.sessions_for_user(app.state.db.user_get("admin")["id"])
+    live = [x for x in rows if x["revoked_at"] is None]
+    assert len(live) == 1 and live[0]["remember"] == 1
+    assert live[0]["expires_at"] == pytest.approx(time.time() + life_s, abs=30)
+    assert (await c.get("/api/status")).status_code == 200
+
+
+def test_sessions_table_migration_adds_remember_column(tmp_path):
+    """A database created before the remember column existed gains it on
+    open — CREATE TABLE IF NOT EXISTS alone never alters a deployed
+    SQLite file, so without the migration every upgraded site would
+    crash on the first login."""
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT);
+        CREATE TABLE sessions (
+            jti          TEXT    PRIMARY KEY,
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            username     TEXT    NOT NULL,
+            created_at   REAL    NOT NULL,
+            last_seen_at REAL    NOT NULL,
+            expires_at   REAL    NOT NULL,
+            revoked_at   REAL,
+            ip           TEXT    NOT NULL DEFAULT '',
+            user_agent   TEXT    NOT NULL DEFAULT ''
+        );
+        """
+    )
+    conn.execute("INSERT INTO users (username) VALUES ('old')")
+    conn.execute(
+        "INSERT INTO sessions (jti, user_id, username, created_at, last_seen_at, expires_at) "
+        "VALUES ('old-jti', 1, 'old', 1, 1, 2)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    try:
+        # Pre-existing row reads as not-remembered; new rows can set it.
+        assert db.session_get("old-jti")["remember"] == 0
+        db.session_create(
+            jti="new-jti", user_id=1, username="old",
+            expires_at=time.time() + 60, remember=True,
+        )
+        assert db.session_get("new-jti")["remember"] == 1
+        # Idempotent: a second open must not try to re-add the column.
+        db.close()
+        Database(path).close()
+    finally:
+        db.close()
 
 
 async def test_login_is_rate_limited_per_account_across_addresses(client):

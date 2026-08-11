@@ -256,6 +256,8 @@ export interface SessionRow {
   expiresAt: number;
   ip: string;
   userAgent: string;
+  // "Keep me signed in" session: long-lived, no idle timeout.
+  remember: boolean;
 }
 
 // Returned by GET /api/config.slack — the bot token itself is never
