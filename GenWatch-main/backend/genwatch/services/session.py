@@ -14,7 +14,11 @@ A request is authenticated only when *all* of these hold:
   3. the account still exists, is not disabled, and its ``token_epoch``
      still matches the one baked into the token (a password change or an
      admin revoke bumps it);
-  4. the session has been used within ``auth.idle_timeout_minutes``.
+  4. the session has been used within ``auth.idle_timeout_minutes`` —
+     unless it is a "keep me signed in" session (see
+     ``auth.remember_me_days``), which trades the idle backstop for not
+     having to retype a password on a trusted device. Rules 1–3 apply to
+     those in full.
 
 Any failure is a 401 and the caller is sent back to the login screen.
 """
@@ -45,6 +49,13 @@ COOKIE_NAMES = (SECURE_COOKIE_NAME, COOKIE_NAME)
 # every request into a SQLite write.
 TOUCH_INTERVAL_S = 60.0
 
+# A remembered ("keep me signed in") session is renewed once less than
+# this fraction of its full lifetime remains. Half means a 365-day
+# session renews roughly twice a year of active use — enough that a
+# device in any sort of regular use never reaches expiry, without
+# rewriting the row and cookie on every request.
+RENEW_AT_REMAINING_FRACTION = 0.5
+
 
 @dataclass
 class SessionPrincipal:
@@ -53,6 +64,7 @@ class SessionPrincipal:
     uid: int
     jti: str
     must_change_password: bool = False
+    remember: bool = False
 
 
 def cookie_name(secure: bool) -> str:
@@ -88,6 +100,12 @@ def resolve_cookie_secure(scheme: str, auth_cfg) -> bool:
     return scheme == "https"
 
 
+def remember_me_hours(auth_cfg) -> int:
+    """Lifetime of a remembered session, in hours. 0 = feature disabled."""
+    days = int(getattr(auth_cfg, "remember_me_days", 0) or 0)
+    return max(0, days) * 24
+
+
 def start_session(
     *,
     db: Database,
@@ -95,17 +113,26 @@ def start_session(
     user: dict,
     ip: str = "",
     user_agent: str = "",
+    remember: bool = False,
 ) -> tuple[str, str, float]:
     """Mint a token and record the matching session row.
 
+    ``remember=True`` asks for a "keep me signed in" session: the long
+    ``auth.remember_me_days`` lifetime instead of ``session_hours``, no
+    idle timeout, and sliding renewal (see :func:`renew_if_due`). The
+    request is honoured only when the feature is enabled in config —
+    with ``remember_me_days: 0`` the box on the login form is a no-op
+    and the caller gets an ordinary session.
+
     Returns ``(token, jti, expires_at)``.
     """
+    remember = bool(remember) and remember_me_hours(auth_cfg) > 0
     jti = new_jti()
     token, jti, expires_at = issue_token(
         secret=auth_cfg.jwt_secret,
         operator=user["username"],
         role=user["role"],
-        hours=auth_cfg.session_hours,
+        hours=remember_me_hours(auth_cfg) if remember else auth_cfg.session_hours,
         uid=int(user["id"]),
         jti=jti,
         epoch=int(user["token_epoch"]),
@@ -117,6 +144,7 @@ def start_session(
         expires_at=expires_at,
         ip=ip,
         user_agent=user_agent,
+        remember=remember,
     )
     # Opportunistic housekeeping: drop rows for sessions that expired over
     # a week ago. Login is the natural place — it's rare, already does a
@@ -167,10 +195,18 @@ def validate(
     if int(payload.get("epoch", 0)) != int(user["token_epoch"]):
         raise AuthError("session invalidated (password changed or sessions revoked)")
 
+    remembered = bool(row.get("remember"))
     idle_minutes = int(getattr(settings.auth, "idle_timeout_minutes", 0) or 0)
-    if idle_minutes > 0 and (now - float(row["last_seen_at"])) > idle_minutes * 60:
+    if (
+        not remembered
+        and idle_minutes > 0
+        and (now - float(row["last_seen_at"])) > idle_minutes * 60
+    ):
         # Mark it revoked so the sessions list shows the truth and the
-        # row can't be resurrected by a later request.
+        # row can't be resurrected by a later request. Remembered
+        # sessions skip this on purpose: "keep me signed in" is exactly
+        # a request not to be timed out for stepping away — the absolute
+        # expiry and every revocation path still apply.
         db.session_revoke(jti)
         raise AuthError(f"session idle for over {idle_minutes} minutes — sign in again")
 
@@ -186,4 +222,50 @@ def validate(
         uid=int(user["id"]),
         jti=jti,
         must_change_password=bool(user["must_change_password"]),
+        remember=remembered,
     )
+
+
+def renew_if_due(*, db: Database, auth_cfg, jti: str) -> tuple[str, float] | None:
+    """Sliding renewal for a remembered session.
+
+    Called after :func:`validate` has already accepted the session (the
+    UI shell hits ``/api/auth/me`` on load and on user activity, which is
+    where this hooks in). When less than ``RENEW_AT_REMAINING_FRACTION``
+    of the lifetime remains, the row's expiry is pushed out to a full
+    ``remember_me_days`` again and a fresh token is minted for the SAME
+    ``jti`` — the session keeps its identity, audit trail, and place in
+    the sessions list; only the horizon moves. The net effect is that a
+    device using the console at least once per ``remember_me_days`` never
+    sees the login page again.
+
+    Returns ``(token, expires_at)`` when a renewal happened, else None.
+    Every guard here re-checks server-side state so a revocation racing
+    the renewal wins: session_extend refuses revoked/expired rows.
+    """
+    hours = remember_me_hours(auth_cfg)
+    if hours <= 0:
+        return None
+    row = db.session_get(jti)
+    if row is None or not row.get("remember") or row["revoked_at"] is not None:
+        return None
+    now = time.time()
+    life_s = hours * 3600.0
+    if float(row["expires_at"]) - now > life_s * RENEW_AT_REMAINING_FRACTION:
+        return None  # plenty of runway left — nothing to write
+    user = db.user_get_by_id(int(row["user_id"]))
+    if user is None or user["disabled"]:
+        return None
+    token, _, expires_at = issue_token(
+        secret=auth_cfg.jwt_secret,
+        operator=user["username"],
+        role=user["role"],
+        hours=hours,
+        uid=int(user["id"]),
+        jti=jti,  # same session, new expiry
+        epoch=int(user["token_epoch"]),
+    )
+    if not db.session_extend(jti, expires_at):
+        return None
+    log.info("remembered session renewed for %s (%s...)", user["username"], jti[:8])
+    return token, expires_at

@@ -19,6 +19,7 @@ config `slack.alert_on_login_failure` / `alert_on_account_lockout`).
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -40,6 +41,11 @@ class LoginBody(BaseModel):
     # 6-digit TOTP code, or a recovery code. Only consulted when the
     # account (or the global policy) requires a second factor.
     totp: str | None = None
+    # "Keep me signed in on this device": mint a long-lived session
+    # (auth.remember_me_days) that skips the idle timeout and renews
+    # itself while the device stays in use. Ignored when the feature is
+    # disabled in config.
+    remember: bool = False
 
 
 class PasswordChangeBody(BaseModel):
@@ -75,13 +81,23 @@ def _users(request: Request) -> UserService:
     return svc
 
 
-def _set_session_cookie(request: Request, response: Response, token: str) -> None:
+def _set_session_cookie(
+    request: Request, response: Response, token: str, expires_at: float
+) -> None:
+    # Max-Age mirrors the server-side session's actual expiry — a
+    # remembered session gets a browser cookie that lives as long as it
+    # does (browsers cap around 400 days; renewal re-issues it long
+    # before that matters). The server row remains the authority either
+    # way: a cookie outliving its session is just a 401.
     settings = request.app.state.settings
     secure = session_svc.resolve_cookie_secure(request.url.scheme, settings.auth)
     response.set_cookie(
         session_svc.cookie_name(secure),
         token,
-        max_age=settings.auth.session_hours * 3600,
+        # ceil, not floor: the cookie must never lapse before the session
+        # it carries (the sub-second between token mint and cookie set
+        # would otherwise shave a second off every Max-Age).
+        max_age=max(60, math.ceil(expires_at - time.time())),
         httponly=True,
         samesite=settings.auth.cookie_samesite,
         secure=secure,
@@ -206,19 +222,23 @@ async def login(request: Request, body: LoginBody, response: Response) -> dict:
     if user_limiter is not None and account_key:
         user_limiter.reset(account_key)
 
-    token, jti, _expires = session_svc.start_session(
+    remembered = bool(body.remember) and session_svc.remember_me_hours(settings.auth) > 0
+    token, jti, expires = session_svc.start_session(
         db=db,
         auth_cfg=settings.auth,
         user=user,
         ip=ip,
         user_agent=request.headers.get("user-agent", ""),
+        remember=body.remember,
     )
     db.user_record_login_ok(int(user["id"]), ip)
-    _set_session_cookie(request, response, token)
+    _set_session_cookie(request, response, token, expires)
     db.write_audit(
         user["username"],
         "auth.login",
-        f"ip={ip}" + (" via-recovery-code" if result.used_recovery_code else ""),
+        f"ip={ip}"
+        + (" via-recovery-code" if result.used_recovery_code else "")
+        + (" remembered" if remembered else ""),
         jti[:8] + "...",
         "ok",
     )
@@ -244,6 +264,7 @@ async def login(request: Request, body: LoginBody, response: Response) -> dict:
         "totpEnabled": bool(user["totp_enabled"]),
         "usedRecoveryCode": result.used_recovery_code,
         "recoveryCodesRemaining": result.recovery_codes_remaining,
+        "remembered": remembered,
     }
 
 
@@ -269,7 +290,7 @@ async def logout(request: Request, response: Response) -> dict:
 
 
 @router.get("/me")
-async def me(request: Request) -> dict:
+async def me(request: Request, response: Response) -> dict:
     # Light-weight identity check used by the UI shell. Returns 200 even
     # when unauthenticated so the UI can redirect to login.
     token = session_svc.read_cookie(request.cookies)
@@ -281,6 +302,21 @@ async def me(request: Request) -> dict:
         )
     except AuthError:
         return {"authenticated": False}
+
+    # The UI shell calls /me on load and on real user activity (its idle
+    # keepalive), which makes it the natural place for remember-me
+    # sliding renewal: a remembered session nearing expiry gets a fresh
+    # token and cookie for the same jti, so a device in regular use
+    # never lands back on the login page.
+    if p.remember:
+        renewed = session_svc.renew_if_due(
+            db=request.app.state.db,
+            auth_cfg=request.app.state.settings.auth,
+            jti=p.jti,
+        )
+        if renewed is not None:
+            _set_session_cookie(request, response, renewed[0], renewed[1])
+
     user = request.app.state.db.user_get_by_id(p.uid) or {}
     return {
         "authenticated": True,
@@ -329,16 +365,19 @@ async def change_password(
 
     # set_password revoked every session including this one. Issue a fresh
     # session for the operator who just did the right thing rather than
-    # bouncing them to the login screen.
+    # bouncing them to the login screen. Rotating a password shouldn't
+    # cost this device its "keep me signed in" status, so the replacement
+    # session inherits the flag from the one being retired.
     fresh = db.user_get_by_id(p.uid) or {}
-    token, jti, _ = session_svc.start_session(
+    token, jti, expires = session_svc.start_session(
         db=db,
         auth_cfg=request.app.state.settings.auth,
         user=fresh,
         ip=_client_ip(request),
         user_agent=request.headers.get("user-agent", ""),
+        remember=p.remember,
     )
-    _set_session_cookie(request, response, token)
+    _set_session_cookie(request, response, token, expires)
     db.write_audit(p.operator, "auth.password", "changed own password", jti[:8] + "...", "ok")
 
     slack = await _slack(request)
@@ -367,6 +406,7 @@ async def list_sessions(
                 "expiresAt": r["expires_at"],
                 "ip": r["ip"],
                 "userAgent": r["user_agent"],
+                "remember": bool(r.get("remember")),
             }
             for r in rows
         ]

@@ -696,6 +696,13 @@ def _check_public_exposure(settings, db: Database) -> None:
             f"auth.session_hours is {settings.auth.session_hours} — consider a "
             "shorter session for an internet-facing console"
         )
+    if settings.auth.remember_me_days > 90:
+        warnings.append(
+            f"auth.remember_me_days is {settings.auth.remember_me_days} — a stolen "
+            "device holds a live session for that long. require_totp plus the "
+            "Settings → Users sign-out-everywhere path are the compensating "
+            "controls; shorten it if those aren't in place"
+        )
     if settings.auth.idle_timeout_minutes <= 0:
         warnings.append(
             "auth.idle_timeout_minutes is 0 — an abandoned browser tab keeps a "
@@ -721,9 +728,10 @@ def _check_public_exposure(settings, db: Database) -> None:
         )
     log.info(
         "public exposure mode: https_required=%s require_totp=%s lockout=%ss "
-        "idle_timeout=%smin allowlist=%d entr%s",
+        "idle_timeout=%smin remember_me=%sd allowlist=%d entr%s",
         settings.https_required, settings.auth.require_totp,
         settings.auth.lockout_seconds, settings.auth.idle_timeout_minutes,
+        settings.auth.remember_me_days,
         len(sec.ip_allowlist), "y" if len(sec.ip_allowlist) == 1 else "ies",
     )
 

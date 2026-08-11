@@ -194,6 +194,25 @@ buys three things a bare signed token cannot:
   from **Settings → Users** — the lost-laptop and departing-contractor
   paths.
 
+**"Keep me signed in on this device."** The login form's checkbox mints a
+long-lived session instead: `auth.remember_me_days` (default 365) of
+absolute lifetime, no idle timeout, and sliding renewal — once less than
+half the lifetime remains, ordinary use of the console pushes the expiry
+back out to a full term, so a device that signs in once and keeps being
+used never sees the login page again.
+
+That is a deliberate trade, and it is bounded by everything above rather
+than exempted from it: a remembered session is still a server-side row,
+still shown (marked *stays signed in*) in the sessions list, and still
+dies instantly on logout, password change, account disable, admin
+revoke, or a `jwt_secret` rotation. What it gives up is the idle/absolute
+backstop for a cookie sitting on a stolen or discarded device — so on an
+internet-facing console, pair it with `auth.require_totp` and use the
+sign-out-everywhere path the moment a device goes missing. Set
+`remember_me_days: 0` to disable the feature entirely (the checkbox is
+then ignored server-side); `security.public_exposure: true` warns when it
+is over 90 days.
+
 A password change bumps the account's token epoch, which invalidates every
 existing session for that account instantly, including the WebSocket feed.
 Disabling an account does the same.

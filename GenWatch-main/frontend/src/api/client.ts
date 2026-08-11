@@ -83,6 +83,9 @@ export interface LoginResponse {
   totpEnabled: boolean;
   usedRecoveryCode: boolean;
   recoveryCodesRemaining: number;
+  // True when the server actually minted a long-lived "keep me signed
+  // in" session (the checkbox was ticked AND the feature is enabled).
+  remembered: boolean;
 }
 
 export const api = {
@@ -90,10 +93,15 @@ export const api = {
   // `totp` is only sent once the server has asked for it (401 with
   // code "totp_required"), so accounts without a second factor never
   // see the field.
-  login: (username: string, password: string, totp?: string) =>
+  login: (username: string, password: string, totp?: string, remember?: boolean) =>
     request<LoginResponse>("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ username, password, ...(totp ? { totp } : {}) }),
+      body: JSON.stringify({
+        username,
+        password,
+        ...(totp ? { totp } : {}),
+        ...(remember ? { remember: true } : {}),
+      }),
     }),
   logout: () => request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 

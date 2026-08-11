@@ -9,12 +9,14 @@ from ..services.auth import AuthError
 
 class Principal:
     def __init__(self, *, operator: str, role: str, uid: int = 0, jti: str = "",
-                 must_change_password: bool = False):
+                 must_change_password: bool = False, remember: bool = False):
         self.operator = operator
         self.role = role
         self.uid = uid
         self.jti = jti
         self.must_change_password = must_change_password
+        # True when this request rode a "keep me signed in" session.
+        self.remember = remember
 
 
 def get_app_state(request: Request):
@@ -50,6 +52,7 @@ def _resolve(request: Request) -> Principal:
         uid=sp.uid,
         jti=sp.jti,
         must_change_password=sp.must_change_password,
+        remember=sp.remember,
     )
 
 
