@@ -110,8 +110,10 @@ export const Icon = ({ name, size = 16, stroke = 1.6 }: { name: IconName; size?:
 
 // ─── Pill ────────────────────────────────────────────────────────────────
 export type Tone = "ok" | "warn" | "alarm" | "info";
-export const Pill = ({ tone, children }: PropsWithChildren<{ tone?: Tone }>) => (
-  <span className="pill" data-tone={tone}><i className="d" />{children}</span>
+// `title` is optional and renders as the native tooltip — a pill often
+// carries a one-word verdict whose reasoning needs somewhere to live.
+export const Pill = ({ tone, title, children }: PropsWithChildren<{ tone?: Tone; title?: string }>) => (
+  <span className="pill" data-tone={tone} title={title}><i className="d" />{children}</span>
 );
 
 // ─── Sparkline ───────────────────────────────────────────────────────────

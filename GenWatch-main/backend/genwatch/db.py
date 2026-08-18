@@ -578,6 +578,46 @@ class Database:
             ).fetchone()
         return int(row["n"] if row else 0)
 
+    def exercise_starts_since(self, since_ts: float) -> list[float]:
+        """Timestamps of transitions into 'exercising' since `since_ts`.
+
+        The H-100's Modbus map exposes no exercise *schedule* register —
+        only the "Internal Exercise Active" status bit (output_status_7
+        mask 0x0020) that engine_state_bits decodes into the
+        'exercising' state. So the schedule the controller actually runs
+        can't be read directly; it can only be observed, by recording
+        when that bit fires. Same derive-from-the-event-stream approach
+        as count_engine_starts() and last_transfer_to_gen().
+
+        Returned oldest-first. See services/exercise.py, which turns
+        these into a day/time the UI can show.
+        """
+        with self._reader() as c:
+            rows = c.execute(
+                "SELECT ts FROM events "
+                "WHERE type = 'TRANSITION' AND message LIKE '%→ exercising%' "
+                "AND ts >= ? ORDER BY ts ASC",
+                (since_ts,),
+            ).fetchall()
+        return [float(r["ts"]) for r in rows]
+
+    def operator_exercise_commands_since(self, since_ts: float) -> list[float]:
+        """Timestamps of confirmed operator quiet-test commands since `since_ts`.
+
+        Used to discount manually-triggered exercises when inferring the
+        controller's own schedule — a one-off Quiet-Test a technician
+        ran on a Thursday is not evidence the unit exercises Thursdays.
+        Returned oldest-first.
+        """
+        with self._reader() as c:
+            rows = c.execute(
+                "SELECT ts FROM events "
+                "WHERE type = 'COMMAND' AND message LIKE '%exercise%' "
+                "AND ts >= ? ORDER BY ts ASC",
+                (since_ts,),
+            ).fetchall()
+        return [float(r["ts"]) for r in rows]
+
     def last_alarm_event(self) -> dict | None:
         """Most recent type='ALARM' event of severity warn/alarm (raise or clear).
 

@@ -141,10 +141,24 @@ export interface StatusBody {
     fuelType?: "diesel" | "gaseous" | "unknown";
   };
   exercise: {
+    // Configured — declared in registers/h100.yaml at commissioning.
     enabled: boolean;
     day: string;
     time: string;
     durationMin: number;
+    // Observed — what the controller has actually been doing, inferred
+    // from its own "Internal Exercise Active" bit (backend
+    // services/exercise.py). null when there isn't enough evidence yet;
+    // absent entirely on backends predating the field. `day`/`time` use
+    // the same vocabulary as the configured fields above so the two can
+    // be compared directly.
+    observed?: {
+      day: string;
+      time: string;
+      samples: number;
+      windowDays: number;
+      lastStartTs: number;
+    } | null;
   };
   activeAlarms: ActiveAlarm[];
   hts: {

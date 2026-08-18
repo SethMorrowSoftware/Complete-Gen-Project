@@ -37,9 +37,22 @@ def test_engine_state_bits_present(regmap):
 
 
 def test_site_rating_and_tank_loaded(regmap):
-    # On-site values for SITE-23 — a 350 kW genset with a 680 gal local tank.
-    assert regmap.site.rating_kw == 350
+    # On-site values for SITE-23 — a 600 kW genset with a 680 gal local
+    # tank. rating_kw is the denominator for the dashboard load ring, so
+    # it is pinned here: the YAML carried 350 for a while, which
+    # understated the set's capacity and overstated every load figure by
+    # ~1.7x.
+    assert regmap.site.rating_kw == 600
     assert regmap.site.tank_gal == 680
+
+
+def test_site_exercise_schedule_loaded(regmap):
+    # The configured schedule. Pinned because it is operator-visible and
+    # has no readback from the controller to correct it — the YAML said
+    # Sunday on a unit that exercises Tuesday, and nothing caught it.
+    assert regmap.site.exercise_enabled is True
+    assert regmap.site.exercise_day == "tue"
+    assert regmap.site.exercise_time == "03:00"
 
 
 def test_site_fuel_type_loaded(regmap):
