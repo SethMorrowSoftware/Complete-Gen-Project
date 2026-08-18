@@ -38,7 +38,12 @@ the setting at the panel, dump again, diff), then map it in the YAML.
 """
 from __future__ import annotations
 
+import datetime as dt
+import logging
 import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+log = logging.getLogger("genwatch.exercise")
 
 # How far back to look. Ten weeks gives a weekly exerciser ~10 samples
 # while staying inside a default retention window, and is short enough
@@ -69,6 +74,36 @@ ROUND_TO_S = 300
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
+def resolve_tz(name: str | None) -> tuple[dt.tzinfo, str]:
+    """Resolve the site's wall clock. Returns (tzinfo, display name).
+
+    Every exercise time in this system — the one typed into the YAML off
+    the panel, and the one inferred from the event log — is a *site local*
+    wall-clock time. Which clock that is has to be stated, not assumed.
+    Server OS installs default to UTC (Ubuntu Server and Raspberry Pi OS
+    alike), and a rack in a different zone from the generator it monitors
+    is normal, so a host left at its default reports every observed time
+    shifted by the site's UTC offset and then flags the correct declared
+    schedule as drifted.
+
+    An unset `site.timezone` falls back to the host zone, which is right
+    whenever the host clock is already site-local. A bad IANA name warns
+    and falls back rather than refusing to boot — a monitoring service
+    should not fail closed over a typo in a display setting.
+    """
+    if name:
+        try:
+            return ZoneInfo(name), name
+        except (ZoneInfoNotFoundError, ValueError):
+            log.warning(
+                "site.timezone %r is not a known IANA zone (e.g. 'America/Chicago') — "
+                "falling back to this host's zone. Exercise times will be shown on the "
+                "server's clock, which may not be the site's.", name,
+            )
+    local = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+    return local, time.tzname[time.daylight and time.localtime().tm_isdst > 0] or str(local)
+
+
 def _collapse_runs(starts: list[float]) -> list[float]:
     """Keep the first timestamp of each distinct exercise run."""
     runs: list[float] = []
@@ -88,7 +123,7 @@ def _drop_operator_initiated(starts: list[float], commands: list[float]) -> list
     ]
 
 
-def observed_schedule(db, *, now: float | None = None) -> dict | None:
+def observed_schedule(db, *, tz: dt.tzinfo | None = None, now: float | None = None) -> dict | None:
     """Infer the schedule the controller actually runs, or None.
 
     Returns ``{"day", "time", "samples", "windowDays", "lastStartTs"}``
@@ -110,10 +145,17 @@ def observed_schedule(db, *, now: float | None = None) -> dict | None:
     # Snap each start to the 5-minute grid *before* splitting it into
     # weekday + time, so a 23:58 start that rounds up to 00:00 carries
     # its weekday over with it instead of being filed under the wrong day.
+    #
+    # The split happens in `tz` — the site's wall clock, not the server's.
+    # These get compared against a schedule someone read off the panel, so
+    # both sides have to be on the same clock. A host left on UTC (the
+    # install default) monitoring a site in, say, US Central would
+    # otherwise report a 10:00 exercise as 15:00 and flag a perfectly
+    # correct config as drifted.
     buckets: dict[tuple[int, str], list[float]] = {}
     for ts in starts:
-        lt = time.localtime(round(ts / ROUND_TO_S) * ROUND_TO_S)
-        buckets.setdefault((lt.tm_wday, f"{lt.tm_hour:02d}:{lt.tm_min:02d}"), []).append(ts)
+        lt = dt.datetime.fromtimestamp(round(ts / ROUND_TO_S) * ROUND_TO_S, tz)
+        buckets.setdefault((lt.weekday(), f"{lt.hour:02d}:{lt.minute:02d}"), []).append(ts)
 
     # Modal weekday first, then the modal start time within it. Ties go
     # to the most recently seen, which tracks a schedule that was

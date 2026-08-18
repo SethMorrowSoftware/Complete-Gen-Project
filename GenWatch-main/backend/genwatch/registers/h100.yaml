@@ -85,16 +85,26 @@ site:
   #   - 'gaseous'  shows O₂ + AFR-related fields (NG/LP engines)
   #   - 'unknown'  shows everything (legacy behaviour)
   fuel_type: diesel
+  # IANA zone for this site's wall clock. Both exercise times below and
+  # the schedule GenWatch infers from the event log are expressed in it.
+  # Leave unset ONLY if the host's own clock is already site-local
+  # (`timedatectl set-timezone ...`). Server installs default to UTC, and
+  # the host may well sit in a different zone from the generator it
+  # monitors; an unset zone on a UTC host reports every observed exercise
+  # shifted by the site's offset, which then reads as config drift.
+  # timezone: America/Chicago
+  #
   # Declared schedule, NOT read back from the controller. The H-100
   # exposes no exercise-schedule register (only the "Internal Exercise
   # Active" status bit and the 0x022B quiet-test control write), so
   # nothing here is cross-checked against the unit — if the schedule is
-  # changed at the panel, this block must be edited to match or the
-  # dashboard chip will quietly show the wrong day.
+  # changed at the panel, this block must be edited to match. GenWatch
+  # does flag the disagreement once it has observed two runs, but it
+  # cannot correct this file for you.
   exercise:
     enabled: true
     day: tue        # mon|tue|wed|thu|fri|sat|sun
-    time: "03:00"   # 24h local
+    time: "10:00"   # 24h, site-local (see timezone above)
     duration_min: 30
     quiet: true
 

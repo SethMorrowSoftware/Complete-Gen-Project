@@ -51,7 +51,7 @@ def test_site_exercise_schedule_loaded(regmap):
     # Sunday on a unit that exercises Tuesday, and nothing caught it.
     assert regmap.site.exercise_enabled is True
     assert regmap.site.exercise_day == "tue"
-    assert regmap.site.exercise_time == "03:00"
+    assert regmap.site.exercise_time == "10:00"
 
 
 # ─── Exercise schedule: absent/invalid must not become a guess ───────────
