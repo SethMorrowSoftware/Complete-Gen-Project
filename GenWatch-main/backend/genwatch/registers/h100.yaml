@@ -67,7 +67,13 @@
 site:
   id: SITE-23
   name: "Generac H-100"
-  rating_kw: 350
+  # Nameplate rating. Not readable from the H-100 — the controller's
+  # Modbus map exposes measured output (total_kw, 0x00AE) but no rated
+  # capacity — so this is a declared value. It is the denominator for the
+  # dashboard load ring and the load % on the ATS card, so a wrong figure
+  # silently misreports how hard the set is working. Confirm on the
+  # generator dataplate, not the engine dataplate.
+  rating_kw: 600
   # No `engine:` key — GenWatch no longer carries an engine make/model
   # label. The value that used to sit here was wrong for this unit and
   # nothing on the H-100 can confirm one. An `engine:` key left in an
@@ -79,9 +85,15 @@ site:
   #   - 'gaseous'  shows O₂ + AFR-related fields (NG/LP engines)
   #   - 'unknown'  shows everything (legacy behaviour)
   fuel_type: diesel
+  # Declared schedule, NOT read back from the controller. The H-100
+  # exposes no exercise-schedule register (only the "Internal Exercise
+  # Active" status bit and the 0x022B quiet-test control write), so
+  # nothing here is cross-checked against the unit — if the schedule is
+  # changed at the panel, this block must be edited to match or the
+  # dashboard chip will quietly show the wrong day.
   exercise:
     enabled: true
-    day: sun        # mon|tue|wed|thu|fri|sat|sun
+    day: tue        # mon|tue|wed|thu|fri|sat|sun
     time: "03:00"   # 24h local
     duration_min: 30
     quiet: true

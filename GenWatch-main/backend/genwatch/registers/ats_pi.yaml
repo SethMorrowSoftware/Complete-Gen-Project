@@ -15,7 +15,6 @@ site:
   # but the SiteConfig schema requires them. Real generator
   # rating/tank/fuel live in registers/h100.yaml.
   rating_kw: 0
-  engine: "n/a (companion device)"
   tank_gal: 0
   fuel_type: unknown
   exercise:

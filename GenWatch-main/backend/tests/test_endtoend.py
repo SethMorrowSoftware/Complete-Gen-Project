@@ -57,6 +57,27 @@ async def test_status_returns_live_snapshot(client):
     assert body["comms"]["state"] in {"healthy", "degraded", "lost"}
 
 
+async def test_status_carries_configured_and_observed_exercise(client):
+    """The exercise block must ship both schedules, not just the YAML one.
+
+    The UI compares them to decide whether to warn that the register
+    map has drifted from what the unit actually does. If `observed` were
+    missing from the payload the chip would silently fall back to
+    displaying the configured value as fact — the exact failure this
+    was built to catch.
+    """
+    await _login(client)
+    body = (await client.get("/api/status")).json()
+    ex = body["exercise"]
+
+    assert ex["day"] == "tue" and ex["time"] == "03:00", "configured schedule from h100.yaml"
+    # Present as a key, null as a value: a freshly-booted test DB has no
+    # exercise history, and "no evidence" must be distinguishable from
+    # "backend too old to report it".
+    assert "observed" in ex
+    assert ex["observed"] is None
+
+
 async def test_status_requires_auth(client):
     # Without a session cookie, /api/status (and the other read
     # endpoints) must 401. Closes Auth H1 from the audit — these

@@ -97,17 +97,7 @@ export function LiveView({ status, history, operator, role, stale, panelStale }:
           </div>
         </div>
         <div className="flex ai-c gap-8">
-          {/* Scheduled-exercise chip. It used to read "Auto · <time> <day>
-              exercise", which was misleading: the word AUTO in this console
-              means the H-100 front-panel key-switch position, and that is
-              reported authoritatively by the topbar Panel chip (App.tsx).
-              This chip only ever described the exercise schedule, so it now
-              says exactly that and nothing more. */}
-          {status.exercise.enabled && (
-            <Pill tone="info">
-              Exercise · {status.exercise.time} {capitalize(status.exercise.day)}
-            </Pill>
-          )}
+          <ExerciseChip exercise={status.exercise} />
         </div>
       </div>
 
@@ -151,6 +141,84 @@ export function LiveView({ status, history, operator, role, stale, panelStale }:
 
 function capitalize(s: string) {
   return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+// ─── Exercise schedule ───────────────────────────────────────────────────
+// The page-head chip here used to read "Auto · <time> <day> exercise".
+// Two things were wrong with that. AUTO in this console means the H-100
+// front-panel key-switch position — reported authoritatively by the
+// topbar Panel chip — so leading with the word implied a claim this chip
+// was not making. And the day came from a hand-typed YAML value that
+// nothing ever checked, so it advertised Sunday on a unit that
+// exercises Tuesday.
+//
+// The backend now also reports the schedule the controller has actually
+// been running, inferred from its own "Internal Exercise Active" bit
+// (services/exercise.py). Prefer that: it is the machine's own behaviour
+// rather than someone's commissioning notes. When the two disagree, show
+// the observed one and go amber — the YAML is the thing that's wrong,
+// and somebody should go fix it.
+
+// Resolve the schedule to display. Shared so the page-head chip and the
+// "Next exercise" row can never disagree with each other.
+function effectiveSchedule(exercise: StatusBody["exercise"]) {
+  const observed = exercise.observed ?? null;
+  const drift =
+    observed != null &&
+    (observed.day !== exercise.day || observed.time !== exercise.time);
+  return {
+    observed,
+    drift,
+    day: observed?.day ?? exercise.day,
+    time: observed?.time ?? exercise.time,
+  };
+}
+
+function ExerciseChip({ exercise }: { exercise: StatusBody["exercise"] }) {
+  if (!exercise.enabled) return null;
+
+  const { observed, drift, day, time } = effectiveSchedule(exercise);
+
+  const title = drift
+    ? `Observed: the controller has started its own exercise ${capitalize(observed!.day)} `
+      + `${observed!.time} on ${observed!.samples} occasion(s) in the last ${observed!.windowDays} days. `
+      + `registers/h100.yaml still declares ${capitalize(exercise.day)} ${exercise.time} — `
+      + `update site.exercise to match the panel.`
+    : observed != null
+    ? `Confirmed against the controller: ${observed.samples} exercise(s) observed on this `
+      + `schedule in the last ${observed.windowDays} days.`
+    : `Declared in registers/h100.yaml. Not yet confirmed against the controller — `
+      + `GenWatch will verify it once it has seen the unit exercise itself twice.`;
+
+  return (
+    <Pill tone={drift ? "warn" : "info"} title={title}>
+      Exercise · {time} {capitalize(day)}
+      {drift && " · config differs"}
+    </Pill>
+  );
+}
+
+// Maintenance-card row. Same resolved schedule as the chip, annotated
+// so the operator can tell a confirmed schedule from a declared one
+// without hunting for the tooltip.
+function NextExerciseRow({ exercise }: { exercise: StatusBody["exercise"] }) {
+  if (!exercise.enabled) {
+    return (
+      <div className="kv-row"><span className="l">Next exercise</span>
+        <span className="v dim">Disabled</span></div>
+    );
+  }
+  const { observed, drift, day, time } = effectiveSchedule(exercise);
+  const note = drift ? "config differs" : observed ? "observed" : "declared";
+  return (
+    <div className="kv-row"><span className="l">Next exercise</span>
+      <span className="v" style={{ color: drift ? "var(--amber)" : undefined }}>
+        {capitalize(day)} · {time}
+        <span style={{ fontSize: 11, color: "var(--text-4)", marginLeft: 6, fontWeight: 400 }}>
+          {note}
+        </span>
+      </span></div>
+  );
 }
 
 // ─── Status hero ──────────────────────────────────────────────────────────
@@ -957,8 +1025,7 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
           <span className="v">{fmt(r.runHours, 1)} h</span></div>
         <div className="kv-row"><span className="l">Engine starts</span>
           <span className="v">{fmt(r.startCount)}</span></div>
-        <div className="kv-row"><span className="l">Next exercise</span>
-          <span className="v">{capitalize(status.exercise.day)} · {status.exercise.time}</span></div>
+        <NextExerciseRow exercise={status.exercise} />
         <div className="kv-row"><span className="l">Last alarm</span>
           <span className="v" title={status.lastAlarm?.message}>
             {status.activeAlarms[0]

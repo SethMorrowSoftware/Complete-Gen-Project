@@ -6,6 +6,7 @@ import time
 from fastapi import APIRouter, Depends, Request
 
 from ..db import COLUMN_MAP
+from ..services import exercise as exercise_svc
 from .deps import Principal, get_principal, require_viewer
 
 
@@ -154,10 +155,18 @@ async def status(request: Request, p: Principal = Depends(require_viewer)) -> di
             "fuelType": regmap.site.fuel_type,
         },
         "exercise": {
+            # Configured (declared in the YAML at commissioning) …
             "enabled": regmap.site.exercise_enabled,
             "day": regmap.site.exercise_day,
             "time": regmap.site.exercise_time,
             "durationMin": regmap.site.exercise_duration_min,
+            # … and observed: what the controller has actually been
+            # doing, inferred from its own "Internal Exercise Active"
+            # bit. None until there is enough evidence. The UI prefers
+            # this over the configured value and flags a mismatch, so a
+            # schedule changed at the panel stops silently rotting in
+            # the YAML. See services/exercise.py.
+            "observed": exercise_svc.observed_schedule(db),
         },
         "activeAlarms": db.active_alarms(),
         "hts": {

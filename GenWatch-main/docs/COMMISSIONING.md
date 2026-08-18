@@ -155,10 +155,32 @@ patterns ride on this map too.
 4. Open the UI (`http://<pi>:8000`), log in, and confirm the **Live view
    populates within ~2 s**, the **Comms badge is green**, and no false
    **STALE DATA** badge.
+5. Check the **declared** site values in the `site:` block of
+   `h100.yaml`. These are the dangerous ones: unlike everything above,
+   they are *not* read from the controller, so `genwatch panel` cannot
+   flag them and they will happily stay wrong for years.
+   - `rating_kw` — from the **generator** dataplate, not the engine
+     dataplate. This is the denominator of the dashboard load ring, so
+     a wrong figure misreports how hard the set is working (a 600 kW
+     set declared as 350 kW shows ~1.7× its real load percentage).
+   - `tank_gal` — usable capacity of the local tank; drives the "~N gal"
+     figure repeated in low-fuel alerts.
+   - `exercise:` `day` / `time` — the schedule **as set on the panel**.
+     Read it off the controller and copy it exactly; do not assume the
+     factory default. GenWatch cross-checks this one after the fact: it
+     records when the H-100 asserts its own "Internal Exercise Active"
+     bit, and once it has seen two runs the page-head Exercise chip
+     switches to the observed schedule, turning amber and appending
+     "config differs" if the YAML disagrees. Treat an amber chip as a
+     YAML bug to fix, not as noise.
+   - There is deliberately **no engine make/model field** — nothing on
+     the wire can confirm one, so GenWatch does not display one.
 
 - **PASS:** every panel value matches the UI / `genwatch panel` (within
-  rounding), engine state is correct, and the **PANEL chip** in the
-  top-right matches the physical key-switch position when you toggle it.
+  rounding), engine state is correct, the **PANEL chip** in the
+  top-right matches the physical key-switch position when you toggle it,
+  and the declared `site:` values match the dataplate and the panel's
+  exercise setting.
 - **If it fails:**
   - Values garbage but link healthy → likely a **G-Panel** (addresses
     shift) or dealer firmware. Use `genwatch scan --start 0x0000 --end

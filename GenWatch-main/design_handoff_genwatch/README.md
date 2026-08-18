@@ -123,7 +123,7 @@ The default view. Shows current generator state, electrical output, engine inter
 
 **Layout:** vertical stack of rows inside a max-width 1480 px main container with 22 px padding.
 
-1. **Page head** — title "Site overview" + sub "SITE-23 · Generac H-100 · 200 kW · last sync 1.5 s ago", right-aligned status pills ("Exercise · 03:00 Sun", "2 HTS · 0 annunciators"). No engine make/model is shown anywhere in the console — the label the spec originally carried was wrong for the installed unit and the H-100 exposes nothing to verify one against.
+1. **Page head** — title "Site overview" + sub "SITE-23 · Generac H-100 · 200 kW · last sync 1.5 s ago", right-aligned status pills ("Exercise · 03:00 Tue", "2 HTS · 0 annunciators"). The exercise pill prefers the schedule GenWatch has *observed* the controller running over the one declared in `h100.yaml`, and goes amber with "· config differs" when they disagree. No engine make/model is shown anywhere in the console — the label the spec originally carried was wrong for the installed unit and the H-100 exposes nothing to verify one against.
 2. **Optional alarm strip** (full-width, red-tinted) — shown only when an alarm is active. LED + code + description + Active pill + "Acknowledge" danger button (right-aligned via margin-left: auto).
 3. **Status hero** (full-width, 1 fr / 1.2 fr grid):
     - **Left half:** state badge ("ON LOAD" pill, colored by state) → big 56 px state title ("Running") → sub "On load · Utility lost · 04:23:21 (time-in-state, mono)" → 3-up hero-stats strip (Frequency / Real power / Engine RPM, mono values @ 18 px).
