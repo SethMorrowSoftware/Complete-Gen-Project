@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 #
-# setup-network.sh — one-time network commissioning for the GenWatch Pi.
+# setup-network.sh — one-time network commissioning for the GenWatch host.
 #
-# Gives the Pi a PERSISTENT static IP on the wired interface (so it keeps its
-# address across reboots) and points GenWatch at the ATS-Pi. Targets
-# NetworkManager (Raspberry Pi OS Bookworm). Interactive, validated, idempotent.
+# Gives the host a PERSISTENT static IP on the wired interface (so it keeps its
+# address across reboots) and points GenWatch at the ATS-Pi. Interactive,
+# validated, idempotent.
+#
+# REQUIRES NetworkManager (nmcli). That is the default on Raspberry Pi OS
+# Bookworm and on Ubuntu Desktop, but NOT on Ubuntu Server, which renders
+# netplan to systemd-networkd. On those hosts this script exits without
+# touching anything — configure the static IP in /etc/netplan instead; see
+# the message at the nmcli check below for the exact YAML.
 #
 # Host networking stays in the OS (not the web UI) on purpose: the genwatch
 # service is hardened/non-root and a web form that changes the box's own IP is a
@@ -27,7 +33,41 @@ is_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 is_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; }
 
 [ "$(id -u)" -eq 0 ] || die "Run as root:  sudo deploy/scripts/setup-network.sh"
-command -v nmcli >/dev/null 2>&1 || die "nmcli not found — this helper targets NetworkManager (Bookworm). For dhcpcd, edit /etc/dhcpcd.conf instead."
+if ! command -v nmcli >/dev/null 2>&1; then
+  # Deliberately not automated for netplan: a static-IP script that gets the
+  # renderer or interface name wrong locks you out of the box it just
+  # reconfigured. Ubuntu Server is the common case here, so print the exact
+  # file to write rather than guessing at it.
+  cat >&2 <<'NETPLAN'
+xx  nmcli not found — this helper only drives NetworkManager.
+
+    On Ubuntu Server (netplan + systemd-networkd), set the static IP by
+    hand. Create /etc/netplan/60-genwatch.yaml (chmod 600), adjusting the
+    interface name from `ip -br link`:
+
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp4: false
+            addresses: [192.168.1.50/24]
+            routes:
+              - to: default
+                via: 192.168.1.1
+            nameservers:
+              addresses: [192.168.1.1]
+
+    Then, with a console attached in case you lose the link:
+      sudo netplan try          # auto-reverts in 120s if you can't confirm
+      sudo netplan apply
+
+    On Raspberry Pi OS Bullseye or older (dhcpcd), edit /etc/dhcpcd.conf.
+
+    Either way, set modbus_tcp.host / ats.host in /etc/genwatch/config.yaml
+    to the ATS-Pi's address afterwards.
+NETPLAN
+  exit 1
+fi
 
 SSH_IF=""
 if [ -n "${SSH_CONNECTION:-}" ]; then

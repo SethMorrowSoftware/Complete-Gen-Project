@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, AtsBlock, AtsMode, EngineState, EventRow, LoadSource, Reading, Role, StatusBody } from "../types";
+import type { ActiveAlarm, AtsBlock, AtsMode, EngineState, EventRow, LoadSource, PanelMode, Reading, Role, StatusBody } from "../types";
 import { ConfirmModal, type ConfirmCmd } from "./ConfirmModal";
 
 interface Props {
@@ -42,7 +42,10 @@ const STATE_LABEL: Record<EngineState, string> = {
 // the warm-up window before transfer (or a forced test); running-with-
 // load is the backup-power case. stateSubFor() picks the right one.
 const STATE_SUB: Record<EngineState, string> = {
-  stopped: "AUTO · Ready",
+  // `stopped` is filled in by stateSubFor from the real key-switch
+  // position — see below. This entry is the fallback for when we don't
+  // know it.
+  stopped: "Stopped",
   cranking: "Engine start in progress",
   running: "On load · Backup power",       // overridden when loadSource = utility
   exercising: "Quiet-Test · No load",
@@ -50,7 +53,27 @@ const STATE_SUB: Record<EngineState, string> = {
   alarm: "Shutdown · Operator action required",
   unknown: "—",
 };
-function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): string {
+
+// What a stopped engine's sub-line says depends entirely on the panel
+// key switch, and this used to hard-code "AUTO · Ready" for every
+// stopped engine regardless of it. That is the most consequential thing
+// on this page to get wrong: a panel in MANUAL or OFF will NOT start on
+// a utility failure, and "AUTO · Ready" tells the operator it will. The
+// topbar Panel chip had the truth the whole time; the hero contradicted
+// it. Now it reads from the same source.
+const STOPPED_SUB: Record<PanelMode, string> = {
+  auto: "AUTO · Ready",
+  manual: "MANUAL · Will not auto-start",
+  off: "OFF · Engine locked out",
+  unknown: "Panel mode unknown",
+};
+
+function stateSubFor(
+  state: EngineState,
+  loadSource: LoadSource | undefined,
+  panelMode: PanelMode | undefined,
+  panelStale: boolean,
+): string {
   if (loadSource === "transferring") {
     return "ATS transferring · brief load gap";
   }
@@ -59,6 +82,11 @@ function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): st
   }
   if (state === "cooling") {
     return "Engine cool-down · Load on utility";
+  }
+  if (state === "stopped") {
+    // A stale panel block means the mode we hold may no longer be true.
+    // Say we don't know rather than assert a possibly-frozen AUTO.
+    return STOPPED_SUB[panelStale ? "unknown" : (panelMode ?? "unknown")];
   }
   return STATE_SUB[state];
 }
@@ -103,7 +131,7 @@ export function LiveView({ status, history, operator, role, stale, panelStale }:
 
       {alarm && <AlarmStrip alarm={alarm} />}
 
-      <StatusHero status={status} history={history} />
+      <StatusHero status={status} history={history} panelStale={panelStale} />
 
       <div className="row-ats" style={{ marginTop: "var(--gap)" }}>
         <AtsCard status={status} role={role} onCommand={setConfirmCmd} stale={stale} />
@@ -267,7 +295,9 @@ function NextExerciseRow({ exercise }: { exercise: StatusBody["exercise"] }) {
 }
 
 // ─── Status hero ──────────────────────────────────────────────────────────
-function StatusHero({ status, history }: { status: StatusBody; history: Reading[] }) {
+function StatusHero({ status, history, panelStale }: {
+  status: StatusBody; history: Reading[]; panelStale: boolean;
+}) {
   const state = status.state;
   const r = status.reading;
   const loadPct = r.kw != null ? Math.min(100, Math.max(0, (r.kw / Math.max(1, status.site.ratingKw)) * 100)) : 0;
@@ -285,7 +315,7 @@ function StatusHero({ status, history }: { status: StatusBody; history: Reading[
           </div>
           <div className="state-title">{STATE_LABEL[state]}</div>
           <div className="state-sub">
-            <strong>{stateSubFor(state, status.loadSource)}</strong>
+            <strong>{stateSubFor(state, status.loadSource, status.panel?.mode, panelStale)}</strong>
             <span className="dot-sep" />
             <span>HTS-1 on {loadSourceLabel(status.loadSource)}</span>
           </div>
@@ -459,8 +489,20 @@ function AtsCard({ status, role, onCommand, stale }: {
                   }
                   strokeWidth="1.5" />
             <text x="72" y="42" textAnchor="middle" fontSize="10" fontFamily="Geist" fontWeight="600" fill="var(--text-3)" letterSpacing="2">UTILITY</text>
+            {/* Availability, never a voltage. Nothing in this system
+                measures the utility leg — not the H-100, not the ATS-Pi
+                (which reports normalAvailable as a boolean). This slot
+                used to render a literal "480 V", sitting directly above
+                the generator block's genuinely-measured voltage in
+                identical type, so a constant from the design mock read
+                as live metering. If the utility sagged or the site
+                wasn't 480 V, it said 480 V regardless. */}
             <text x="72" y="60" textAnchor="middle" fontSize="13" fontFamily="JetBrains Mono" fontWeight="500" fill="var(--text)">
-              {ats && ats.normalAvailable === false ? "LOST" : "480 V"}
+              {ats
+                ? ats.normalAvailable === false ? "LOST"
+                  : ats.normalAvailable === true ? "AVAILABLE"
+                  : "—"
+                : "—"}
             </text>
 
             {/* Generator block */}
