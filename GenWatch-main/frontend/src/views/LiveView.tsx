@@ -161,28 +161,60 @@ function capitalize(s: string) {
 
 // Resolve the schedule to display. Shared so the page-head chip and the
 // "Next exercise" row can never disagree with each other.
+//
+// Three outcomes, and the difference between them matters to whoever is
+// reading the panel: `observed` (the controller's own behaviour),
+// `declared` (someone's YAML, unverified), or nothing known at all.
 function effectiveSchedule(exercise: StatusBody["exercise"]) {
   const observed = exercise.observed ?? null;
+  // A schedule is only "declared" if BOTH halves survived backend
+  // validation — half a schedule can't be displayed or compared.
+  const declared =
+    exercise.day != null && exercise.time != null
+      ? { day: exercise.day, time: exercise.time }
+      : null;
   const drift =
-    observed != null &&
-    (observed.day !== exercise.day || observed.time !== exercise.time);
+    observed != null && declared != null &&
+    (observed.day !== declared.day || observed.time !== declared.time);
+  const shown = observed ?? declared;
   return {
     observed,
+    declared,
     drift,
-    day: observed?.day ?? exercise.day,
-    time: observed?.time ?? exercise.time,
-  };
+    source: observed ? "observed" : declared ? "declared" : "unknown",
+    day: shown?.day ?? null,
+    time: shown?.time ?? null,
+  } as const;
 }
 
 function ExerciseChip({ exercise }: { exercise: StatusBody["exercise"] }) {
   if (!exercise.enabled) return null;
 
-  const { observed, drift, day, time } = effectiveSchedule(exercise);
+  const { observed, declared, drift, source, day, time } = effectiveSchedule(exercise);
+
+  // Nothing known from either side. Say so rather than showing a
+  // plausible-looking default — this chip's whole history is of
+  // displaying a schedule nobody had actually confirmed.
+  if (source === "unknown") {
+    return (
+      <Pill
+        tone="warn"
+        title={
+          "No exercise schedule is declared in registers/h100.yaml (or the declared one "
+          + "failed validation — check the backend log for a site.exercise warning). "
+          + "Set site.exercise.day and .time to match the panel; GenWatch will also learn "
+          + "the schedule on its own once it has seen the unit exercise itself twice."
+        }
+      >
+        Exercise · schedule not set
+      </Pill>
+    );
+  }
 
   const title = drift
     ? `Observed: the controller has started its own exercise ${capitalize(observed!.day)} `
       + `${observed!.time} on ${observed!.samples} occasion(s) in the last ${observed!.windowDays} days. `
-      + `registers/h100.yaml still declares ${capitalize(exercise.day)} ${exercise.time} — `
+      + `registers/h100.yaml still declares ${capitalize(declared!.day)} ${declared!.time} — `
       + `update site.exercise to match the panel.`
     : observed != null
     ? `Confirmed against the controller: ${observed.samples} exercise(s) observed on this `
@@ -192,7 +224,7 @@ function ExerciseChip({ exercise }: { exercise: StatusBody["exercise"] }) {
 
   return (
     <Pill tone={drift ? "warn" : "info"} title={title}>
-      Exercise · {time} {capitalize(day)}
+      Exercise · {time} {capitalize(day!)}
       {drift && " · config differs"}
     </Pill>
   );
@@ -208,12 +240,18 @@ function NextExerciseRow({ exercise }: { exercise: StatusBody["exercise"] }) {
         <span className="v dim">Disabled</span></div>
     );
   }
-  const { observed, drift, day, time } = effectiveSchedule(exercise);
-  const note = drift ? "config differs" : observed ? "observed" : "declared";
+  const { drift, source, day, time } = effectiveSchedule(exercise);
+  if (source === "unknown") {
+    return (
+      <div className="kv-row"><span className="l">Next exercise</span>
+        <span className="v" style={{ color: "var(--amber)" }}>Not set</span></div>
+    );
+  }
+  const note = drift ? "config differs" : source;
   return (
     <div className="kv-row"><span className="l">Next exercise</span>
       <span className="v" style={{ color: drift ? "var(--amber)" : undefined }}>
-        {capitalize(day)} · {time}
+        {capitalize(day!)} · {time}
         <span style={{ fontSize: 11, color: "var(--text-4)", marginLeft: 6, fontWeight: 400 }}>
           {note}
         </span>
