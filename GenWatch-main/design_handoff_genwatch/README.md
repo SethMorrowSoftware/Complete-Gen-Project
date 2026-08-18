@@ -123,7 +123,7 @@ The default view. Shows current generator state, electrical output, engine inter
 
 **Layout:** vertical stack of rows inside a max-width 1480 px main container with 22 px padding.
 
-1. **Page head** — title "Site overview" + sub "SITE-23 · Generac H-100 · 200 kW · Cummins QSB7-G5 · last sync 1.5 s ago", right-aligned status pills ("Auto · 03:00 Sun exercise", "2 HTS · 0 annunciators").
+1. **Page head** — title "Site overview" + sub "SITE-23 · Generac H-100 · 200 kW · last sync 1.5 s ago", right-aligned status pills ("Exercise · 03:00 Sun", "2 HTS · 0 annunciators"). No engine make/model is shown anywhere in the console — the label the spec originally carried was wrong for the installed unit and the H-100 exposes nothing to verify one against.
 2. **Optional alarm strip** (full-width, red-tinted) — shown only when an alarm is active. LED + code + description + Active pill + "Acknowledge" danger button (right-aligned via margin-left: auto).
 3. **Status hero** (full-width, 1 fr / 1.2 fr grid):
     - **Left half:** state badge ("ON LOAD" pill, colored by state) → big 56 px state title ("Running") → sub "On load · Utility lost · 04:23:21 (time-in-state, mono)" → 3-up hero-stats strip (Frequency / Real power / Engine RPM, mono values @ 18 px).
@@ -133,8 +133,8 @@ The default view. Shows current generator state, electrical output, engine inter
     - **Electrical card** ("Generator Output · 3-phase · Line-to-Line"): two columns. Left = Voltage L–L with three phase rows (A–B / B–C / C–A) showing label · proportional bar · mono value + sparkline strip. Right = Current per phase (A / B / C). Below, a separator and three BigMetric tiles: Frequency / Real power / Apparent (each with sparkline).
     - **Controls card** ("Operator · two-step confirm"): vertical stack of 4 `.ctl-btn` buttons (Remote Start / Remote Stop / Quiet-Test / Transfer back). Each button: 32 px tinted icon square · two-line label+desc · keyboard hint chip. Disabled state opacity 0.45. State validity rules (see §Controls). Footer: lock-icon caption "Commands write to 0x00A0–A2 via FC06. Engine hardware safeties (panel) remain primary."
 5. **Row: Engine (2/3) + Tank/Maintenance (1/3)**
-    - **Engine card** ("Cummins QSB7-G5 · 200 kW"): 4-up grid of EngineMetric tiles (RPM, Oil pres., Coolant, Battery). Each tile: label + warn-range hint, big mono value, range bar OR sparkline (toggled by tweak), tinted by metric color (green/blue/amber/text-2).
-    - **Tank & Maintenance card**: fuel bar (% + ~gal, green→amber gradient, red when <25 %), with tick marks at every 10 %, and a kv list (Run hours, Since last service, Next service due, Next exercise, Last alarm).
+    - **Engine card** ("Engine", no sub-label): 4-up grid of EngineMetric tiles (RPM, Oil pres., Coolant, Battery). Each tile: label + warn-range hint, big mono value, range bar OR sparkline (toggled by tweak), tinted by metric color (green/blue/amber/text-2).
+    - **Tank & Maintenance card**: fuel bar first (% + ~gal, green→amber gradient, red when <25 %), coolant-level bar below it, both with tick marks at every 10 % and a shared 0–100 % scale printed under the lower bar; then a kv list (Run hours, Since last service, Next service due, Next exercise, Last alarm).
 6. **Recent events** (full-width) — compact `EventsFeed` showing 6 latest events; each row: relative time (mono) · severity dot · type tag · description · meta.
 7. **Footer** (sticky-feel, but in normal flow): "GenWatch · running on raspberry-pi-4 · uvicorn 0.32 · pymodbus 3.7 · python 3.11" left, "/dev/ttyUSB0 · 9600 8N1 · slave 100 (0x64) · 1,847.6 h" right (mono).
 

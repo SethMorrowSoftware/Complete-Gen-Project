@@ -68,7 +68,10 @@ site:
   id: SITE-23
   name: "Generac H-100"
   rating_kw: 350
-  engine: "Cummins QSB7-G5"   # verify — QSB7 is unusual above ~300 kW; confirm engine name on the dataplate
+  # No `engine:` key — GenWatch no longer carries an engine make/model
+  # label. The value that used to sit here was wrong for this unit and
+  # nothing on the H-100 can confirm one. An `engine:` key left in an
+  # older file is ignored on load.
   tank_gal: 680
   # Fuel type drives a few UI decisions:
   #   - 'diesel'   hides the O₂ sensor card (diesels have no O₂ probe — the

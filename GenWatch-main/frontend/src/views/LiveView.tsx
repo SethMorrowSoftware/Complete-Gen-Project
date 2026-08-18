@@ -92,14 +92,20 @@ export function LiveView({ status, history, operator, role, stale, panelStale }:
           <div className="page-eyebrow">Live overview · {status.site.id}</div>
           <h1 className="page-title">{status.site.name}</h1>
           <div className="page-sub">
-            {status.site.ratingKw} kW · {status.site.engine} · last sync{" "}
+            {status.site.ratingKw} kW · last sync{" "}
             <span className="mono">{(status.comms.rateMs / 1000).toFixed(1)} s ago</span>
           </div>
         </div>
         <div className="flex ai-c gap-8">
+          {/* Scheduled-exercise chip. It used to read "Auto · <time> <day>
+              exercise", which was misleading: the word AUTO in this console
+              means the H-100 front-panel key-switch position, and that is
+              reported authoritatively by the topbar Panel chip (App.tsx).
+              This chip only ever described the exercise schedule, so it now
+              says exactly that and nothing more. */}
           {status.exercise.enabled && (
             <Pill tone="info">
-              Auto · {status.exercise.time} {capitalize(status.exercise.day)} exercise
+              Exercise · {status.exercise.time} {capitalize(status.exercise.day)}
             </Pill>
           )}
         </div>
@@ -702,8 +708,12 @@ function EngineCard({ status, history }: { status: StatusBody; history: Reading[
       ? (status.state === "exercising" ? "quiet test" : "no load")
       : undefined;
 
+  // No make/model sub-label on this card: the register map carried a
+  // hard-coded engine name that did not match the unit in the field, and
+  // nothing on the wire tells us what the engine actually is. Better to
+  // show no label than a wrong one.
   return (
-    <Card title="Engine" sub={status.site.engine}
+    <Card title="Engine"
           actions={<Pill tone={r.oilP != null && r.oilP < 25 && (r.rpm ?? 0) > 100 ? "alarm" : "ok"}>nominal</Pill>}>
       <div className="grid g-4" style={{ gap: 18 }}>
         <EngineMetric label="RPM"           value={fmt(r.rpm)}            unit="rpm" sparkPoints={history.map((h) => h.rpm ?? 0).reverse()} color="var(--green)"  warnRange={[1750, 1850]} numeric={r.rpm}      min={0}  max={2200} />
@@ -905,22 +915,11 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
     "Tank";
   return (
     <Card title="Tank · Maintenance" sub={`${fuelLabel} · ${status.site.tankGal} gal`}>
+      {/* Fuel sits above coolant: fuel level is the number an operator
+          checks first (it decides whether the unit can carry the next
+          outage), so it gets the top slot. The 0–100 % scale stays under
+          the lower bar, where it reads as a shared axis for both. */}
       <div style={{ padding: "4px 0 14px" }}>
-        <div className="label-row" style={{ padding: "0 0 8px" }}>
-          <span>Coolant level</span>
-          <span className="mono" style={{ textTransform: "none", letterSpacing: 0, color: lowCool ? "var(--amber)" : "var(--text-2)" }}>
-            {coolLevel != null ? `${coolLevel.toFixed(1)} %` : "—"}
-          </span>
-        </div>
-        <div className="fuel-bar">
-          <i style={{ width: `${coolBarPct}%`, background: lowCool ? "linear-gradient(90deg, var(--amber), var(--red))" : "linear-gradient(90deg, var(--blue), color-mix(in oklch, var(--blue) 70%, var(--green)))" }} />
-          <div className="ticks">
-            {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
-          </div>
-        </div>
-      </div>
-
-      <div style={{ padding: "4px 0 16px" }}>
         <div className="label-row" style={{ padding: "0 0 8px" }}>
           <span>Fuel level</span>
           <span className="mono" style={{ textTransform: "none", letterSpacing: 0, color: lowFuel ? "var(--amber)" : "var(--text-2)" }}>
@@ -929,6 +928,21 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
         </div>
         <div className="fuel-bar">
           <i style={{ width: `${fuelBarPct}%` }} data-low={lowFuel ? "1" : "0"} />
+          <div className="ticks">
+            {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: "4px 0 16px" }}>
+        <div className="label-row" style={{ padding: "0 0 8px" }}>
+          <span>Coolant level</span>
+          <span className="mono" style={{ textTransform: "none", letterSpacing: 0, color: lowCool ? "var(--amber)" : "var(--text-2)" }}>
+            {coolLevel != null ? `${coolLevel.toFixed(1)} %` : "—"}
+          </span>
+        </div>
+        <div className="fuel-bar">
+          <i style={{ width: `${coolBarPct}%`, background: lowCool ? "linear-gradient(90deg, var(--amber), var(--red))" : "linear-gradient(90deg, var(--blue), color-mix(in oklch, var(--blue) 70%, var(--green)))" }} />
           <div className="ticks">
             {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
           </div>
