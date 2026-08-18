@@ -150,7 +150,6 @@ async def status(request: Request, p: Principal = Depends(require_viewer)) -> di
             "id": regmap.site.id,
             "name": regmap.site.name,
             "ratingKw": regmap.site.rating_kw,
-            "engine": regmap.site.engine,
             "tankGal": regmap.site.tank_gal,
             "fuelType": regmap.site.fuel_type,
         },

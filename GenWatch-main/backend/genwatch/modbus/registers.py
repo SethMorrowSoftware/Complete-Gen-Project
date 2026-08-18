@@ -106,7 +106,10 @@ class SiteConfig:
     id: str = "SITE-1"
     name: str = "Generac H-100"
     rating_kw: int = 200
-    engine: str = "Cummins QSB7-G5"
+    # No engine make/model field. The one that used to live here was a
+    # hard-coded guess that did not match the unit in the field, and the
+    # H-100 exposes nothing on the wire to verify it against. An `engine:`
+    # key left in an existing YAML is simply ignored.
     tank_gal: int = 220
     # Fuel type — 'diesel' | 'gaseous' | 'unknown'. Drives UI gating
     # (hide O₂ sensor card on diesel, etc.). Default 'unknown' so legacy
@@ -351,7 +354,6 @@ def load_register_map(path: Path | str) -> RegisterMap:
         id=site_d.get("id", "SITE-1"),
         name=site_d.get("name", "Generac H-100"),
         rating_kw=int(site_d.get("rating_kw", 200)),
-        engine=site_d.get("engine", "Cummins QSB7-G5"),
         tank_gal=int(site_d.get("tank_gal", 220)),
         fuel_type=fuel_type,
         exercise_enabled=bool(ex.get("enabled", True)),
