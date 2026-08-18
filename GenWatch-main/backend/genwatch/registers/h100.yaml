@@ -73,7 +73,7 @@ site:
   # dashboard load ring and the load % on the ATS card, so a wrong figure
   # silently misreports how hard the set is working. Confirm on the
   # generator dataplate, not the engine dataplate.
-  rating_kw: 600
+  rating_kw: 350
   # No `engine:` key — GenWatch no longer carries an engine make/model
   # label. The value that used to sit here was wrong for this unit and
   # nothing on the H-100 can confirm one. An `engine:` key left in an

@@ -13,11 +13,18 @@ State and alarms on the H-100 are bitfield-derived, not enum-derived.
 """
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import yaml
+
+log = logging.getLogger("genwatch.registers")
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 RegType = Literal["u16", "s16", "u32", "u32_lo", "s32", "bitfld", "enum"]
 RegTier = Literal["prime", "base"]
@@ -116,8 +123,15 @@ class SiteConfig:
     # YAML files without the field continue showing every metric.
     fuel_type: str = "unknown"
     exercise_enabled: bool = True
-    exercise_day: str = "sun"
-    exercise_time: str = "03:00"
+    # No default schedule. These used to default to "sun" / "03:00",
+    # which meant a YAML with no (or a malformed) `site.exercise` block
+    # produced a confident, entirely invented "Sunday 03:00" on the
+    # dashboard — indistinguishable from a real declared schedule, and
+    # wrong on every site that doesn't happen to exercise then. None
+    # means "nobody told us"; the UI says so instead of guessing, and
+    # the observed schedule (services/exercise.py) can fill it in.
+    exercise_day: str | None = None
+    exercise_time: str | None = None
     exercise_duration_min: int = 30
     exercise_quiet: bool = True
 
@@ -341,6 +355,53 @@ def validate_register_map(rm: RegisterMap) -> MapValidation:
     return MapValidation(errors=errors, warnings=warnings)
 
 
+def _exercise_day(raw: object, path: Path) -> str | None:
+    """Validate a declared exercise weekday, or None if not usable.
+
+    Returning None rather than a fallback is the point: an absent or
+    typo'd day must read as "nobody told us" all the way to the UI, not
+    as a confident wrong answer. A typo is logged loudly because the
+    operator who wrote `day: tues` will otherwise wonder why their
+    schedule vanished.
+    """
+    if raw is None:
+        return None
+    day = str(raw).strip().lower()
+    if day in WEEKDAYS:
+        return day
+    log.warning(
+        "%s: site.exercise.day is %r, which is not one of %s — treating the exercise "
+        "day as unset. The dashboard will show the schedule as not configured until "
+        "this is fixed (or until GenWatch observes the unit exercising).",
+        path.name, raw, "/".join(WEEKDAYS),
+    )
+    return None
+
+
+def _exercise_time(raw: object, path: Path) -> str | None:
+    """Validate a declared exercise time as 24h "HH:MM", or None."""
+    if raw is None:
+        return None
+    # YAML parses an unquoted 03:00 as a sexagesimal integer (180), which
+    # is why the shipped map quotes it. Catch that specific mistake by
+    # name — "180" is a baffling thing to see in a log otherwise.
+    if isinstance(raw, int):
+        log.warning(
+            "%s: site.exercise.time parsed as the integer %d — YAML reads an unquoted "
+            "HH:MM as base-60. Quote it (time: \"03:00\"). Treating the time as unset.",
+            path.name, raw,
+        )
+        return None
+    t = str(raw).strip()
+    if _HHMM.match(t):
+        return t
+    log.warning(
+        "%s: site.exercise.time is %r, which is not 24h HH:MM — treating the exercise "
+        "time as unset.", path.name, raw,
+    )
+    return None
+
+
 def load_register_map(path: Path | str) -> RegisterMap:
     p = Path(path)
     with p.open() as f:
@@ -357,8 +418,8 @@ def load_register_map(path: Path | str) -> RegisterMap:
         tank_gal=int(site_d.get("tank_gal", 220)),
         fuel_type=fuel_type,
         exercise_enabled=bool(ex.get("enabled", True)),
-        exercise_day=str(ex.get("day", "sun")).lower(),
-        exercise_time=str(ex.get("time", "03:00")),
+        exercise_day=_exercise_day(ex.get("day"), p),
+        exercise_time=_exercise_time(ex.get("time"), p),
         exercise_duration_min=int(ex.get("duration_min", 30)),
         exercise_quiet=bool(ex.get("quiet", True)),
     )

@@ -37,12 +37,11 @@ def test_engine_state_bits_present(regmap):
 
 
 def test_site_rating_and_tank_loaded(regmap):
-    # On-site values for SITE-23 — a 600 kW genset with a 680 gal local
-    # tank. rating_kw is the denominator for the dashboard load ring, so
-    # it is pinned here: the YAML carried 350 for a while, which
-    # understated the set's capacity and overstated every load figure by
-    # ~1.7x.
-    assert regmap.site.rating_kw == 600
+    # On-site values for SITE-23 — a 350 kW genset with a 680 gal local
+    # tank. rating_kw is pinned because it is the denominator for the
+    # dashboard load ring and the ATS card's load %, so a wrong figure
+    # misreports how hard the set is working rather than failing loudly.
+    assert regmap.site.rating_kw == 350
     assert regmap.site.tank_gal == 680
 
 
@@ -53,6 +52,75 @@ def test_site_exercise_schedule_loaded(regmap):
     assert regmap.site.exercise_enabled is True
     assert regmap.site.exercise_day == "tue"
     assert regmap.site.exercise_time == "03:00"
+
+
+# ─── Exercise schedule: absent/invalid must not become a guess ───────────
+# These pin the fix for the bug's second half. The loader used to default
+# exercise_day/time to "sun"/"03:00", so a register map that said nothing
+# about exercising still put a confident "Sunday 03:00" on the dashboard —
+# indistinguishable from a real declared schedule, and wrong everywhere it
+# wasn't a coincidence. Absent or unparseable must reach the UI as None.
+
+def _site_yaml(exercise_block: str = "") -> str:
+    # Block style, so the exercise mapping nests *under* site: — flow
+    # style would put it at the top level where the loader never sees it.
+    site = "site:\n  id: X\n  name: Y\n"
+    if exercise_block:
+        site += "  " + exercise_block
+    return site + _MIN_YAML
+
+
+def _load(tmp_path, yaml_text: str):
+    p = tmp_path / "m.yaml"
+    p.write_text(yaml_text)
+    return load_register_map(p)
+
+
+def test_missing_exercise_block_yields_no_schedule(tmp_path):
+    """A map that says nothing about exercising must claim nothing."""
+    site = _load(tmp_path, _site_yaml()).site
+    assert site.exercise_day is None
+    assert site.exercise_time is None
+
+
+def test_unrecognized_weekday_is_rejected_not_kept(tmp_path):
+    """`day: tues` is a typo, not a schedule.
+
+    Keeping the raw string would put "Tues" on the chip, which reads as
+    a real setting. None makes the UI say the schedule isn't configured.
+    """
+    site = _load(tmp_path, _site_yaml("exercise: { day: tues, time: '03:00' }\n")).site
+    assert site.exercise_day is None
+    assert site.exercise_time == "03:00", "the valid half of the block still loads"
+
+
+def test_unquoted_time_is_rejected(tmp_path):
+    """YAML reads an unquoted 3:00 as base-60 — the int 180, not a time.
+
+    Silently coercing that to a string would display "180" as the
+    exercise time; keeping a default would display a fiction.
+    """
+    site = _load(tmp_path, _site_yaml("exercise: { day: tue, time: 3:00 }\n")).site
+    assert site.exercise_time is None
+    assert site.exercise_day == "tue"
+
+
+@pytest.mark.parametrize("bad", ["25:00", "3:00", "0300", "03:60", "sunrise", ""])
+def test_malformed_times_are_rejected(tmp_path, bad):
+    site = _load(tmp_path, _site_yaml(f"exercise: {{ day: tue, time: '{bad}' }}\n")).site
+    assert site.exercise_time is None, f"{bad!r} is not a 24h HH:MM time"
+
+
+@pytest.mark.parametrize("day", ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
+def test_every_weekday_is_accepted(tmp_path, day):
+    site = _load(tmp_path, _site_yaml(f"exercise: {{ day: {day}, time: '03:00' }}\n")).site
+    assert site.exercise_day == day
+
+
+def test_weekday_case_and_padding_are_tolerated(tmp_path):
+    """Operators type into YAML by hand; don't punish ' Tue '."""
+    site = _load(tmp_path, _site_yaml("exercise: { day: '  Tue  ', time: '03:00' }\n")).site
+    assert site.exercise_day == "tue"
 
 
 def test_site_fuel_type_loaded(regmap):

@@ -142,9 +142,13 @@ export interface StatusBody {
   };
   exercise: {
     // Configured — declared in registers/h100.yaml at commissioning.
+    // null when the YAML declares no schedule, or declares one the
+    // backend rejected (bad weekday, non-HH:MM time). There is
+    // deliberately no fallback: a missing schedule must not render as a
+    // confident guess. See backend SiteConfig.exercise_day.
     enabled: boolean;
-    day: string;
-    time: string;
+    day: string | null;
+    time: string | null;
     durationMin: number;
     // Observed — what the controller has actually been doing, inferred
     // from its own "Internal Exercise Active" bit (backend
