@@ -75,6 +75,11 @@ async def status(request: Request, p: Principal = Depends(require_viewer)) -> di
 
     last_alarm = db.last_alarm_event()
 
+    # The site's wall clock. Both exercise schedules (declared and
+    # observed) are site-local times, so they must be derived and
+    # displayed against the same zone.
+    site_tz, site_tz_name = exercise_svc.resolve_tz(regmap.site.timezone)
+
     # Panel block: surfaces previously-dead polled registers and decodes
     # the key-switch position. Operator commands from this UI only
     # engage the controller when panel.mode == 'auto'.
@@ -166,7 +171,12 @@ async def status(request: Request, p: Principal = Depends(require_viewer)) -> di
             # this over the configured value and flags a mismatch, so a
             # schedule changed at the panel stops silently rotting in
             # the YAML. See services/exercise.py.
-            "observed": exercise_svc.observed_schedule(db),
+            "observed": exercise_svc.observed_schedule(db, tz=site_tz),
+            # Which wall clock BOTH of the above are expressed in. Shown
+            # in the UI because a Pi left on the image's default UTC is
+            # the likeliest reason an observed time looks wrong by a few
+            # hours, and that is invisible otherwise.
+            "timezone": site_tz_name,
         },
         "activeAlarms": db.active_alarms(),
         "hts": {

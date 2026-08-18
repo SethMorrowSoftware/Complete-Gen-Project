@@ -211,16 +211,23 @@ function ExerciseChip({ exercise }: { exercise: StatusBody["exercise"] }) {
     );
   }
 
-  const title = drift
+  // Always name the clock. Both schedules are site-local wall times, and
+  // if that clock is wrong (a Pi left on UTC) every observed time is off
+  // by the site's offset — which looks like a broken feature rather than
+  // a misconfigured host unless the zone is stated.
+  const tz = exercise.timezone ? ` Times shown in ${exercise.timezone}.` : "";
+
+  const title = (drift
     ? `Observed: the controller has started its own exercise ${capitalize(observed!.day)} `
       + `${observed!.time} on ${observed!.samples} occasion(s) in the last ${observed!.windowDays} days. `
       + `registers/h100.yaml still declares ${capitalize(declared!.day)} ${declared!.time} — `
-      + `update site.exercise to match the panel.`
+      + `update site.exercise to match the panel, or set site.timezone if the times look `
+      + `shifted by a whole number of hours.`
     : observed != null
     ? `Confirmed against the controller: ${observed.samples} exercise(s) observed on this `
       + `schedule in the last ${observed.windowDays} days.`
     : `Declared in registers/h100.yaml. Not yet confirmed against the controller — `
-      + `GenWatch will verify it once it has seen the unit exercise itself twice.`;
+      + `GenWatch will verify it once it has seen the unit exercise itself twice.`) + tz;
 
   return (
     <Pill tone={drift ? "warn" : "info"} title={title}>

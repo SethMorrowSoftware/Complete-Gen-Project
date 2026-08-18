@@ -70,12 +70,16 @@ async def test_status_carries_configured_and_observed_exercise(client):
     body = (await client.get("/api/status")).json()
     ex = body["exercise"]
 
-    assert ex["day"] == "tue" and ex["time"] == "03:00", "configured schedule from h100.yaml"
+    assert ex["day"] == "tue" and ex["time"] == "10:00", "configured schedule from h100.yaml"
     # Present as a key, null as a value: a freshly-booted test DB has no
     # exercise history, and "no evidence" must be distinguishable from
     # "backend too old to report it".
     assert "observed" in ex
     assert ex["observed"] is None
+    # The clock both schedules are expressed in. Without this the UI
+    # cannot tell the operator that an observed time looked wrong only
+    # because the host is on UTC.
+    assert isinstance(ex["timezone"], str) and ex["timezone"]
 
 
 async def test_status_requires_auth(client):

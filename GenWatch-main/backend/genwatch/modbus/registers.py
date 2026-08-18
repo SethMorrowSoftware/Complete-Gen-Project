@@ -122,6 +122,13 @@ class SiteConfig:
     # (hide O₂ sensor card on diesel, etc.). Default 'unknown' so legacy
     # YAML files without the field continue showing every metric.
     fuel_type: str = "unknown"
+    # IANA zone the site's wall clock runs on (e.g. "America/Chicago").
+    # Exercise times — both the declared one below and the one GenWatch
+    # infers from the event log — are site-local wall-clock times, so the
+    # zone has to be stated rather than assumed. None means "use the
+    # host's zone", which is correct only if the Pi itself was set to
+    # site-local; the stock image is UTC. See services/exercise.py.
+    timezone: str | None = None
     exercise_enabled: bool = True
     # No default schedule. These used to default to "sun" / "03:00",
     # which meant a YAML with no (or a malformed) `site.exercise` block
@@ -417,6 +424,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         rating_kw=int(site_d.get("rating_kw", 200)),
         tank_gal=int(site_d.get("tank_gal", 220)),
         fuel_type=fuel_type,
+        timezone=(str(site_d["timezone"]).strip() or None) if site_d.get("timezone") else None,
         exercise_enabled=bool(ex.get("enabled", True)),
         exercise_day=_exercise_day(ex.get("day"), p),
         exercise_time=_exercise_time(ex.get("time"), p),

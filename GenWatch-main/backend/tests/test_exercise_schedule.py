@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -29,13 +30,13 @@ def db(tmp_path) -> Database:
 
 
 def _at(now: float, *, weekday: int, hour: int, minute: int, weeks_ago: int,
-        lag_s: float = 0.0) -> float:
-    """Local-time timestamp for the Nth-most-recent given weekday/time.
+        lag_s: float = 0.0, tz: dt.tzinfo | None = None) -> float:
+    """Timestamp for the Nth-most-recent given weekday/time in `tz`.
 
     `lag_s` models the delay between the controller's scheduled start and
     GenWatch first polling the exercise-active bit (crank + poll cadence).
     """
-    d = dt.datetime.fromtimestamp(now).replace(
+    d = dt.datetime.fromtimestamp(now, tz).replace(
         hour=hour, minute=minute, second=0, microsecond=0
     )
     while d.weekday() != weekday:
@@ -172,6 +173,73 @@ def test_recent_pattern_wins_after_a_schedule_change(db):
     got = ex.observed_schedule(db, now=now)
     assert got is not None
     assert got["day"] == "tue", "the schedule in effect now is the one to show"
+
+
+# ─── Timezone ────────────────────────────────────────────────────────────
+# The schedule typed into the YAML is read off the generator's panel, so
+# it is a site-local wall time. The observed schedule has to be derived on
+# that same clock or the two aren't comparable. The Raspberry Pi OS image
+# ships set to UTC, so a monitor installed without setting the host zone
+# reports every exercise shifted by the site's offset — and then flags a
+# perfectly correct config as drifted.
+
+CHICAGO = ZoneInfo("America/Chicago")
+
+
+def test_observed_time_is_reported_on_the_site_clock(db):
+    """A 10:00 Chicago exercise reads as 10:00, not as its UTC instant.
+
+    This is the bug that made the feature look broken: on a UTC host the
+    same events reported 15:00 (or 16:00 outside DST), which no operator
+    could reconcile with the 10:00 on their panel.
+    """
+    now = time.time()
+    for w in range(4):
+        _exercise_start(db, _at(now, weekday=TUESDAY, hour=10, minute=0,
+                                weeks_ago=w, lag_s=58, tz=CHICAGO))
+
+    got = ex.observed_schedule(db, tz=CHICAGO, now=now)
+    assert got is not None
+    assert (got["day"], got["time"]) == ("tue", "10:00")
+
+
+def test_same_events_shift_when_read_on_the_wrong_clock(db):
+    """Pin the failure mode itself, so the fix can't silently regress.
+
+    Identical events, read in UTC instead of the site's zone, land on a
+    different wall time — that difference is exactly what an unset
+    site.timezone costs, and why it is worth configuring.
+    """
+    now = time.time()
+    for w in range(4):
+        _exercise_start(db, _at(now, weekday=TUESDAY, hour=10, minute=0,
+                                weeks_ago=w, tz=CHICAGO))
+
+    on_site = ex.observed_schedule(db, tz=CHICAGO, now=now)
+    on_utc = ex.observed_schedule(db, tz=dt.timezone.utc, now=now)
+    assert on_site is not None and on_utc is not None
+    assert on_site["time"] == "10:00"
+    assert on_utc["time"] != on_site["time"], (
+        "reading site-local events on the server's clock must shift them — "
+        "if this ever matches, the test's fixture stopped exercising the bug"
+    )
+
+
+def test_unknown_timezone_falls_back_instead_of_crashing(db):
+    """A typo'd zone must not take the monitor down.
+
+    This is a display setting on a device whose job is to keep showing
+    generator telemetry during an outage.
+    """
+    tz, name = ex.resolve_tz("Not/AZone")
+    assert tz is not None
+    assert isinstance(name, str) and name
+
+
+def test_configured_timezone_is_resolved_by_name(db):
+    tz, name = ex.resolve_tz("America/Chicago")
+    assert name == "America/Chicago"
+    assert dt.datetime.fromtimestamp(time.time(), tz).utcoffset() != dt.timedelta(0)
 
 
 def test_reported_shape_matches_the_configured_vocabulary(db):

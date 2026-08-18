@@ -163,6 +163,12 @@ export interface StatusBody {
       windowDays: number;
       lastStartTs: number;
     } | null;
+    // Wall clock both schedules above are expressed in (IANA name, or
+    // the host's zone abbreviation when site.timezone is unset). Shown
+    // in the UI: a Pi left on the image's default UTC is the likeliest
+    // reason an observed time looks hours off, and that is otherwise
+    // invisible from the dashboard.
+    timezone?: string;
   };
   activeAlarms: ActiveAlarm[];
   hts: {
