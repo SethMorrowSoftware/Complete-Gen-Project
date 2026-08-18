@@ -159,9 +159,11 @@ if [[ "$SD_VER" =~ ^[0-9]+$ ]] && (( SD_VER < 243 )); then
   warn "systemd $SD_VER is older than 243 — the RebootWatchdogSec hardware-watchdog drop-in may be ignored on this host."
 fi
 
-if [[ "$PI_MODEL" != *"Raspberry Pi"* ]]; then
-  warn "Host doesn't look like a Raspberry Pi ('$PI_MODEL'). Continuing anyway."
-fi
+# Deliberately no "this isn't a Raspberry Pi" warning. Ubuntu Server is a
+# first-class target (see the OS gate above), and warning on every install
+# there trains operators to scroll past warnings that do matter — the
+# hardware-watchdog availability check near the end being the one that
+# actually differs by host. The detected model is already logged above.
 
 # ─── 1. apt deps ──────────────────────────────────────────────────────────
 ensure_apt_pkgs \
@@ -432,7 +434,19 @@ systemctl daemon-reexec || warn "systemctl daemon-reexec failed — HW watchdog 
 # next reboot — exactly when nobody expects it to be off. RuntimeWatchdogUSec=0
 # means not armed.
 if systemctl show -p RuntimeWatchdogUSec 2>/dev/null | grep -q 'RuntimeWatchdogUSec=0$'; then
-  warn "Hardware watchdog NOT active yet (RuntimeWatchdogUSec=0). Reboot to apply, then verify: systemctl show -p RuntimeWatchdogUSec"
+  # Two very different situations produce RuntimeWatchdogUSec=0, and
+  # telling the operator to "reboot to apply" when the host has no
+  # watchdog device at all sends them chasing a fix that cannot work —
+  # and leaves them believing the kernel-hang backstop is coming. Check
+  # for the device so we can say which case this is.
+  if compgen -G "/dev/watchdog*" >/dev/null 2>&1; then
+    warn "Hardware watchdog NOT active yet (RuntimeWatchdogUSec=0), but /dev/watchdog exists. Reboot to apply, then verify: systemctl show -p RuntimeWatchdogUSec"
+  else
+    warn "No /dev/watchdog on this host — the hardware watchdog is UNAVAILABLE, not merely unarmed."
+    warn "  GenWatch's own service-level restart still works; what you do NOT have is recovery from a kernel/pid-1 hang."
+    warn "  Common on VMs and cloud instances. On libvirt/KVM, add <watchdog model='i6300esb' action='reset'/> to the guest."
+    warn "  On bare-metal x86 the driver may just need loading (try: modprobe iTCO_wdt), then re-run this installer."
+  fi
 else
   log "Hardware watchdog active ($(systemctl show -p RuntimeWatchdogUSec 2>/dev/null || echo '?'))"
 fi

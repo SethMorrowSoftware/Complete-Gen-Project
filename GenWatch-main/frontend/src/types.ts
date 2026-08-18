@@ -65,8 +65,14 @@ export interface ActiveAlarm {
   raw: number;
 }
 
+// H-100 front-panel key-switch position. Only 'auto' lets the controller
+// act on a utility failure or accept a remote command; the others mean
+// an operator at the unit has taken local control. 'unknown' means the
+// bits didn't decode — treat it as "not auto", never as "probably auto".
+export type PanelMode = "auto" | "manual" | "off" | "unknown";
+
 export interface PanelBlock {
-  mode: "auto" | "manual" | "off" | "unknown";
+  mode: PanelMode;
   keySwitchRaw: number | null;
   engineStatusCode: number | null;
   activeAlarmCountHw: number | null;

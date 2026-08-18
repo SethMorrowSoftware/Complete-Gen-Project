@@ -1,12 +1,14 @@
 # Castle Generator Monitor
 
-Professional monitoring and control software for the **Generac H-100** industrial generator, running on a **Raspberry Pi 5** and talking to the controller over a **Modbus-RTU-over-TCP** network bridge (Lantronix UDS / EDS / xDirect, Moxa NPort, Digi PortServer, ser2net, etc.).
+Professional monitoring and control software for the **Generac H-100** industrial generator, talking to the controller over a **Modbus-RTU-over-TCP** network bridge (Lantronix UDS / EDS / xDirect, Moxa NPort, Digi PortServer, ser2net, etc.).
+
+Runs on any systemd Linux host with Python 3.11+ — **Ubuntu Server (20.04+)** and **Raspberry Pi OS / Debian Bookworm or Trixie** are both first-class targets, and `install.sh` supports either. The Pi 5 appliance build is documented end-to-end below (§2) because it is the self-contained option; on an existing server, skip to `install.sh` and the register-map setup. The one thing that genuinely differs by host is the hardware watchdog — see the reliability note.
 
 A single-pane operator console: live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer) gated on the H-100 front-panel key switch, time-series history, alarms, and on-device configuration of the link, register map, and retention policy.
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and a production boot with no usable admin account refuse to start; per-operator accounts with roles, server-side revocable sessions, per-IP *and* per-account brute-force limits, optional TOTP, and a `security.public_exposure` gate that refuses an unsafe internet-facing config; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (426 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (host reboots on a kernel hang — **where the host actually exposes `/dev/watchdog`**: a Pi always does, bare-metal x86 usually does, a VM usually does *not* unless the hypervisor is configured to present one, and `install.sh` tells you which case you are in rather than letting you assume coverage); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and a production boot with no usable admin account refuse to start; per-operator accounts with roles, server-side revocable sessions, per-IP *and* per-account brute-force limits, optional TOTP, and a `security.public_exposure` gate that refuses an unsafe internet-facing config; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite uses a single persistent WAL writer connection (telemetry + retention writes off the event loop, lock-free concurrent reads, periodic `wal_checkpoint(TRUNCATE)` to bound the WAL) so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; short/truncated Modbus frames count as failures (never zero-extend a decode), the watchdog heartbeat is gated on the engine-state registers decoding fresh, and 16-bit-in-u32 sensors decode low-word-only so a framing slip can't inflate a reading; confirm tokens are 128-bit with a monotonic-clock TTL; `GENWATCH_*` env vars correctly override `config.yaml`; Slack notifier dedupes flapping alarms within a 60 s window, drops the oldest (not newest) on overflow, and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` (install refuses to run unpinned) and `npm ci --ignore-scripts` on every install; confirm tokens are verb-bound (a token issued for one action can't be spent on another); login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (426 tests).
 
 ---
 
@@ -32,15 +34,15 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 
 ## Quick start
 
-Assumes a Raspberry Pi 5 running Raspberry Pi OS Bookworm (64-bit) and a network serial bridge (Lantronix, Moxa, etc.) that is **already wired to the H-100 and already on your LAN** — e.g. the same bridge you've been using with GenLink from Windows.
+Assumes a systemd Linux host — Ubuntu Server 20.04+ or Raspberry Pi OS / Debian Bookworm+ — and a network serial bridge (Lantronix, Moxa, etc.) that is **already wired to the H-100 and already on your LAN** — e.g. the same bridge you've been using with GenLink from Windows.
 
 ```bash
-# 1. Verify the bridge is reachable from where the Pi will live
+# 1. Verify the bridge is reachable from where the host will live
 ping -c 3 192.168.1.249              # your bridge's IP
 nc -vz 192.168.1.249 10001           # "succeeded" = listening
 
-# 2. SSH to the Pi and install
-ssh pi@<your-pi-ip>
+# 2. SSH to the host and install
+ssh <you>@<your-host-ip>
 git clone https://github.com/SethMorrowSoftware/GenWatch.git
 cd GenWatch
 sudo ./deploy/scripts/install.sh
@@ -54,7 +56,7 @@ sudo systemctl restart genwatch
 sudo genwatch doctor                          # expect "Modbus: slave 100 responded"
 ```
 
-Then open `http://<your-pi-ip>:8000` and log in. The Live view should populate within ~2 s.
+Then open `http://<your-host-ip>:8000` and log in. The Live view should populate within ~2 s.
 
 > **Bringing this live against real hardware?** Follow the step-by-step
 > field procedure in **[`docs/COMMISSIONING.md`](docs/COMMISSIONING.md)** —
@@ -93,6 +95,16 @@ You need:
 ---
 
 ## 2. Prepare the Raspberry Pi 5
+
+> **Deploying to an existing Ubuntu Server instead?** Skip this whole
+> section — it covers building the self-contained Pi appliance (imaging,
+> BOM, cooling, SD/NVMe). On a server you already run, go straight to
+> §3 (network bridge) and then `sudo ./deploy/scripts/install.sh`, which
+> supports Ubuntu 20.04+ as a first-class target. Two things to carry
+> across: set `site.timezone` in the register map (or the host clock) to
+> the generator's local zone, and check what `install.sh` reports about
+> the hardware watchdog — a VM typically has none, which removes the
+> kernel-hang backstop described above.
 
 ### 2.1 Install Raspberry Pi OS Bookworm (64-bit)
 
