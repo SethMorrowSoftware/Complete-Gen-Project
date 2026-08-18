@@ -52,6 +52,12 @@ def test_site_exercise_schedule_loaded(regmap):
     assert regmap.site.exercise_enabled is True
     assert regmap.site.exercise_day == "tue"
     assert regmap.site.exercise_time == "10:00"
+    # The site is in New York, and the times above are its wall clock.
+    # Pinned explicitly: with this unset the schedule is interpreted on
+    # whatever zone the host happens to run (UTC on a stock server
+    # install), which shifts every observed exercise by 4-5 hours and
+    # reports a correct config as drifted.
+    assert regmap.site.timezone == "America/New_York"
 
 
 # ─── Exercise schedule: absent/invalid must not become a guess ───────────

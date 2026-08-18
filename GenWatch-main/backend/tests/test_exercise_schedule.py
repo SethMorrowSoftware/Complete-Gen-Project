@@ -225,6 +225,33 @@ def test_same_events_shift_when_read_on_the_wrong_clock(db):
     )
 
 
+def test_schedule_survives_a_dst_changeover(db):
+    """A 10:00 exercise stays 10:00 across the EST/EDT boundary.
+
+    The observation window is 70 days, so in March and November it
+    straddles a changeover: some runs are EST, some EDT, and their UTC
+    instants differ by an hour. Bucketing on the *zone* keeps them all on
+    10:00. Bucketing on a fixed offset would split them 50/50 across
+    09:00 and 10:00, halving the sample count behind whichever won and
+    potentially reporting the wrong hour outright.
+    """
+    ny = ZoneInfo("America/New_York")
+    # Tuesdays either side of the 2026 spring-forward (Sun 2026-03-08).
+    tuesdays = [dt.datetime(2026, 2, 17, 10, 0, tzinfo=ny),   # EST
+                dt.datetime(2026, 2, 24, 10, 0, tzinfo=ny),   # EST
+                dt.datetime(2026, 3, 10, 10, 0, tzinfo=ny),   # EDT
+                dt.datetime(2026, 3, 17, 10, 0, tzinfo=ny)]   # EDT
+    assert len({d.utcoffset() for d in tuesdays}) == 2, "fixture must span the change"
+    for d in tuesdays:
+        _exercise_start(db, d.timestamp() + 52)
+
+    now = dt.datetime(2026, 3, 20, 12, 0, tzinfo=ny).timestamp()
+    got = ex.observed_schedule(db, tz=ny, now=now)
+    assert got is not None
+    assert (got["day"], got["time"]) == ("tue", "10:00")
+    assert got["samples"] == 4, "every run counts, on both sides of the change"
+
+
 def test_unknown_timezone_falls_back_instead_of_crashing(db):
     """A typo'd zone must not take the monitor down.
 
