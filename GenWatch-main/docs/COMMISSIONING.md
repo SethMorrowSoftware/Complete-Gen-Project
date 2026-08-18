@@ -166,14 +166,19 @@ patterns ride on this map too.
    - `tank_gal` — usable capacity of the local tank; drives the "~N gal"
      figure repeated in low-fuel alerts.
    - `timezone` — the site's IANA zone (e.g. `America/Chicago`). **Set
-     this, or set the Pi's own clock to site-local** (`sudo timedatectl
-     set-timezone ...`). The stock Raspberry Pi OS image is UTC; leaving
-     both at the default means every exercise GenWatch observes is
-     reported shifted by the site's UTC offset, which then reads as
-     config drift against a perfectly correct schedule. Symptom: the
-     Exercise chip shows a time some whole number of hours off and says
-     "config differs". The chip's tooltip names the clock in use — if it
-     says UTC and your site isn't, that's the bug.
+     this, or set the host's own clock to site-local** (`sudo timedatectl
+     set-timezone ...`; check with `timedatectl show -p Timezone`).
+     Server installs default to UTC — Ubuntu Server and Raspberry Pi OS
+     alike — and the host may sit in a different zone from the generator
+     it monitors. Leaving both at the default means every exercise
+     GenWatch observes is reported shifted by the site's UTC offset,
+     which then reads as config drift against a perfectly correct
+     schedule. Symptom: the Exercise chip shows a time some whole number
+     of hours off and says "config differs". The chip's tooltip names the
+     clock in use — if it says UTC and your site isn't, that's the bug.
+     Prefer `site.timezone` when the host is shared or deliberately kept
+     on UTC; prefer `timedatectl` when the box exists to run GenWatch and
+     you want its logs on site time too.
    - `exercise:` `day` / `time` — the schedule **as set on the panel**.
      Read it off the controller and copy it exactly; do not assume the
      factory default. GenWatch cross-checks this one after the fact: it

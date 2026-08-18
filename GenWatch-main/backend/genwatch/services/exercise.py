@@ -79,15 +79,16 @@ def resolve_tz(name: str | None) -> tuple[dt.tzinfo, str]:
 
     Every exercise time in this system — the one typed into the YAML off
     the panel, and the one inferred from the event log — is a *site local*
-    wall-clock time. Which clock that is has to be stated, not assumed:
-    the Raspberry Pi OS image ships set to UTC, so a monitor installed
-    without a `timedatectl set-timezone` reports every observed time
-    shifted by the site's UTC offset, and then flags the correct declared
+    wall-clock time. Which clock that is has to be stated, not assumed.
+    Server OS installs default to UTC (Ubuntu Server and Raspberry Pi OS
+    alike), and a rack in a different zone from the generator it monitors
+    is normal, so a host left at its default reports every observed time
+    shifted by the site's UTC offset and then flags the correct declared
     schedule as drifted.
 
     An unset `site.timezone` falls back to the host zone, which is right
-    whenever the Pi has been set to site-local. A bad IANA name warns and
-    falls back rather than refusing to boot — a monitoring appliance
+    whenever the host clock is already site-local. A bad IANA name warns
+    and falls back rather than refusing to boot — a monitoring service
     should not fail closed over a typo in a display setting.
     """
     if name:
@@ -147,10 +148,10 @@ def observed_schedule(db, *, tz: dt.tzinfo | None = None, now: float | None = No
     #
     # The split happens in `tz` — the site's wall clock, not the server's.
     # These get compared against a schedule someone read off the panel, so
-    # both sides have to be on the same clock. A Pi left on UTC (the image
-    # default) monitoring a site in, say, US Central would otherwise report
-    # a 10:00 exercise as 15:00 and flag a perfectly correct config as
-    # drifted.
+    # both sides have to be on the same clock. A host left on UTC (the
+    # install default) monitoring a site in, say, US Central would
+    # otherwise report a 10:00 exercise as 15:00 and flag a perfectly
+    # correct config as drifted.
     buckets: dict[tuple[int, str], list[float]] = {}
     for ts in starts:
         lt = dt.datetime.fromtimestamp(round(ts / ROUND_TO_S) * ROUND_TO_S, tz)
